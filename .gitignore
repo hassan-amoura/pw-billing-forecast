@@ -1,0 +1,10 @@
+# Secrets — every credential lives in the environment, never in the repo.
+.env
+.env.local
+
+# Runtime store (supplier lines + audit). Rebuilt from the committed seed.json
+# on boot, so it is deliberately not tracked.
+data/
+
+node_modules/
+.DS_Store

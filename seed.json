@@ -1,0 +1,42 @@
+{
+  "nextLineID": 5,
+  "supplierLines": [
+    {
+      "id": 1,
+      "moduleID": 214,
+      "supplier": "Acme Structural Ltd",
+      "description": "",
+      "months": {
+        "2026-09": 600
+      }
+    },
+    {
+      "id": 2,
+      "moduleID": 214,
+      "supplier": "Beta Consulting",
+      "description": "",
+      "months": {
+        "2026-09": 250
+      }
+    },
+    {
+      "id": 3,
+      "moduleID": 214,
+      "supplier": "Gamma Engineering",
+      "description": "",
+      "months": {
+        "2026-09": 500
+      }
+    },
+    {
+      "id": 4,
+      "moduleID": 214,
+      "supplier": "Skyline Structural",
+      "description": "",
+      "months": {
+        "2026-09": 500
+      }
+    }
+  ],
+  "audit": []
+}

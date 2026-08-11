@@ -1,0 +1,1362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projectworks — Billing Forecast</title>
+<style>
+  :root{
+    --navy:#0F1D27;
+    --navy-2:#15262F;
+    --paper:#FBFCFC;
+    --ink:#1B2A33;
+    --line:#E3E9EC;
+    --lime:#C8F231;
+    --lime-ink:#5E7A00;
+    --red:#B4382E;
+    --muted:#67757D;
+    --cell-hover:#F5F8EA;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,Menlo,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:var(--sans);color:var(--ink);background:var(--paper);display:flex;flex-direction:column}
+
+  /* ---- brand band ---- */
+  header{
+    background:var(--navy);color:#E8EEF1;
+    display:flex;align-items:center;gap:14px;
+    padding:12px 20px;flex:none;
+  }
+  .logo{
+    width:26px;height:26px;border-radius:6px;background:var(--lime);
+    display:grid;place-items:center;color:var(--navy);
+    font-family:var(--mono);font-weight:700;font-size:15px;
+  }
+  .brand{font-size:14px;font-weight:600;letter-spacing:.01em}
+  .brand small{display:block;font-family:var(--mono);font-size:10px;font-weight:400;color:#8FA3AD;letter-spacing:.14em;text-transform:uppercase;margin-top:2px}
+  .spacer{flex:1}
+  .chip{
+    font-family:var(--mono);font-size:11px;letter-spacing:.05em;
+    border:1px solid #2A3E4A;border-radius:999px;padding:4px 11px;color:#9DB2BC;
+  }
+  .chip.on{border-color:var(--lime);color:var(--lime)}
+  /* the tenant chip is the one thing on screen that says WHICH tenant this is,
+     so it reads as a label + value rather than another status pill */
+  .chip.tenant{
+    display:flex;align-items:baseline;gap:7px;cursor:help;
+    font-family:var(--sans);letter-spacing:0;padding:4px 13px;
+  }
+  .chip.tenant .tlabel{
+    font-family:var(--mono);font-size:9px;letter-spacing:.14em;
+    text-transform:uppercase;color:#8FA3AD;
+  }
+  .chip.tenant .tname{font-size:12.5px;font-weight:600;color:#E8EEF1}
+  .chip.tenant.on{border-color:var(--lime)}
+  .chip.tenant.on .tname{color:var(--lime)}
+  .chip.tenant.bad{border-color:var(--red)}
+  .chip.tenant.bad .tname{color:#F1A79F}
+  .chip.sync{transition:color .2s}
+  .chip.sync.flash{color:var(--lime);border-color:var(--lime)}
+
+  /* ---- toolbar ---- */
+  .toolbar{
+    display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px;
+    padding:14px 20px;border-bottom:1px solid var(--line);background:#fff;flex:none;
+  }
+  .field{display:flex;flex-direction:column;gap:4px}
+  .field label{
+    font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted);
+  }
+  .field select,.field input[type=search]{
+    font:13px var(--sans);padding:7px 9px;border:1px solid var(--line);
+    border-radius:6px;background:#fff;color:var(--ink);min-width:130px;
+  }
+  .field select{
+    appearance:none;-webkit-appearance:none;padding-right:26px;
+    background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2367757D' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 9px center/10px 6px;
+  }
+  .field input:focus,.field select:focus{outline:2px solid var(--lime);outline-offset:1px}
+
+  /* ---- custom month picker ---- */
+  .mpick{position:relative}
+  .mpick-btn{
+    font:13px var(--sans);padding:7px 26px 7px 9px;border:1px solid var(--line);
+    border-radius:6px;color:var(--ink);min-width:130px;text-align:left;cursor:pointer;
+    background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2367757D' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 9px center/10px 6px;
+  }
+  .mpick-btn:focus{outline:2px solid var(--lime);outline-offset:1px}
+  .mpick-btn.empty{color:var(--muted)}
+  .mpick-pop{
+    position:absolute;top:calc(100% + 4px);left:0;z-index:40;
+    background:#fff;border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 10px 30px rgba(15,29,39,.18);width:252px;padding:8px;
+  }
+  .mpick-cols{display:flex;gap:8px}
+  .mpick-years{display:flex;flex-direction:column;gap:2px;max-height:176px;overflow:auto;padding-right:2px}
+  .mpick-years .yr{
+    font:12px var(--mono);border:0;background:none;border-radius:5px;
+    padding:5px 10px;cursor:pointer;color:var(--ink);text-align:center;
+  }
+  .mpick-years .yr:hover{background:var(--cell-hover)}
+  .mpick-years .yr:focus{outline:2px solid var(--lime);outline-offset:-1px}
+  .mpick-years .yr.sel{background:var(--navy);color:#fff}
+  .mpick-months{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;flex:1;align-content:start}
+  .mpick-months .mo{
+    font:12.5px var(--sans);border:1px solid transparent;background:none;border-radius:5px;
+    padding:9px 0;cursor:pointer;color:var(--ink);
+  }
+  .mpick-months .mo:hover{background:var(--cell-hover)}
+  .mpick-months .mo:focus{outline:2px solid var(--lime);outline-offset:-1px}
+  .mpick-months .mo.sel{background:var(--lime);color:var(--navy);font-weight:600}
+  .mpick-foot{display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+  .mpick-foot .lnk{font:12px var(--sans);border:0;background:none;color:var(--lime-ink);cursor:pointer;padding:0}
+  .mpick-foot .lnk:hover{text-decoration:underline}
+  .checks{display:flex;gap:16px;align-items:center;padding-bottom:8px}
+  .checks label{font-size:12.5px;color:var(--ink);display:flex;gap:6px;align-items:center;cursor:pointer}
+  button.primary{
+    font:600 13px var(--sans);padding:9px 18px;border:0;border-radius:6px;
+    background:var(--lime);color:var(--navy);cursor:pointer;
+  }
+  button.primary:hover{filter:brightness(.95)}
+  button.primary:disabled{opacity:.5;cursor:wait}
+  button.ghost{
+    font:500 12.5px var(--sans);padding:8px 14px;border:1px solid var(--line);
+    border-radius:6px;background:#fff;color:var(--ink);cursor:pointer;
+  }
+  button.ghost:hover{border-color:var(--muted)}
+
+  /* ---- tabs ---- */
+  .tabs{display:flex;gap:2px;padding:0 20px;background:#fff;border-bottom:1px solid var(--line);flex:none}
+  .tab{
+    font:500 13px var(--sans);padding:11px 16px;border:0;background:none;cursor:pointer;
+    color:var(--muted);border-bottom:2px solid transparent;
+  }
+  .tab.active{color:var(--ink);border-bottom-color:var(--lime-ink);font-weight:600}
+  .tab .n{font-family:var(--mono);font-size:11px;color:var(--muted);margin-left:6px}
+
+  /* ---- notices ---- */
+  .notice{
+    font-size:12.5px;padding:8px 20px;background:#FFF8E7;border-bottom:1px solid #F0E3BC;color:#6B5A1E;
+  }
+  .notice.hidden,.hidden{display:none}
+  .toast{
+    position:fixed;bottom:18px;right:18px;max-width:420px;z-index:50;
+    background:var(--navy);color:#E8EEF1;font-size:12.5px;
+    padding:10px 14px;border-radius:8px;box-shadow:0 6px 24px rgba(15,29,39,.35);
+    opacity:0;transform:translateY(6px);transition:all .25s;pointer-events:none;
+  }
+  .toast.show{opacity:1;transform:none}
+  .toast.err{background:var(--red)}
+
+  /* ---- grid ---- */
+  .gridwrap{flex:1;overflow:auto;position:relative}
+  table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:12.5px}
+  thead th{
+    position:sticky;top:0;z-index:3;background:var(--navy);
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    color:#fff;font-weight:600;text-align:right;
+    padding:9px 12px;border-bottom:1px solid var(--navy);
+    border-right:1px solid #2A3E4A;white-space:nowrap;
+    cursor:pointer;user-select:none;
+  }
+  thead th.txt{text-align:left}
+  thead th .arr{font-size:9px}
+  thead th .hcell{display:inline-flex;align-items:center;gap:6px;max-width:100%}
+  thead th .hlabel{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  thead th.wrap .hlabel{white-space:normal;overflow:visible;text-overflow:clip}
+  thead th .sortbtn{
+    border:0;background:transparent;color:inherit;padding:0;margin:0;
+    font:10px var(--mono);line-height:1;cursor:pointer;opacity:.78;
+  }
+  thead th .sortbtn:hover{opacity:1;color:var(--lime)}
+  thead th.dragging{opacity:.7}
+  thead th.dropcue{box-shadow:inset 0 0 0 2px var(--lime)}
+  tbody td{
+    padding:6px 12px;border-bottom:1px solid var(--line);border-right:1px solid var(--line);
+    white-space:nowrap;
+    font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;background:#fff;
+  }
+  tbody td.txt{font-family:var(--sans);text-align:left}
+  tbody td.wrap,tfoot td.wrap{white-space:normal}
+  tbody tr:hover td{background:var(--cell-hover)}
+  td.neg{color:var(--red)}
+  td.zero{color:var(--muted)}
+
+  /* deep links into Projectworks: read as grid text, underline on hover only */
+  a.pwl{color:inherit;text-decoration:none}
+  a.pwl:hover{text-decoration:underline}
+  td.stat{color:var(--lime-ink);font-weight:700;text-align:center}
+  td.stat.inactive{color:var(--muted)}
+  .empty{padding:60px 20px;text-align:center;color:var(--muted);font-size:13px}
+
+  /* sticky identity columns (left offsets set at render time) */
+  th.stick,td.stick{position:sticky;z-index:2;background:#fff}
+  thead th.stick{z-index:4;background:var(--navy)}
+  tfoot td.stick{z-index:4;background:var(--navy)}
+
+  /* editable month cells */
+  td.mcell{padding:0}
+  td.mcell input{
+    width:96px;border:0;background:transparent;text-align:right;
+    font:12.5px var(--mono);font-variant-numeric:tabular-nums;
+    padding:7px 12px;color:var(--ink);
+  }
+  td.mcell input:focus{outline:2px solid var(--lime);outline-offset:-2px;background:#fff}
+  td.mcell input:disabled{color:var(--muted)}
+  td.mcell.saved{animation:pulse 1.1s ease-out}
+  td.mcell.failed{animation:pulsered 1.1s ease-out}
+  @keyframes pulse{0%{background:var(--lime)}100%{background:transparent}}
+  @keyframes pulsered{0%{background:#F3C4BF}100%{background:transparent}}
+  @media (prefers-reduced-motion:reduce){
+    td.mcell.saved,td.mcell.failed{animation:none}
+    .toast{transition:none}
+  }
+
+  /* footer mirrors the header band: navy, white bold text, same padding/borders */
+  tfoot td{
+    position:sticky;bottom:0;background:var(--navy);color:#fff;
+    font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;
+    font-weight:700;
+    padding:9px 12px;border-top:1px solid #2A3E4A;border-right:1px solid #2A3E4A;
+    white-space:nowrap;z-index:3;
+  }
+  tfoot td.txt{text-align:left;font-family:var(--sans);font-weight:700}
+  tfoot td.neg{color:#F1A79F}
+  tfoot td.zero{color:#8FA3AD}
+
+  /* ---- column settings modal ---- */
+  .modal-back{position:fixed;inset:0;background:rgba(15,29,39,.45);display:grid;place-items:center;z-index:60}
+  .modal-back.hidden{display:none}
+  .modal{background:#fff;border-radius:10px;padding:18px 20px 16px;width:300px;box-shadow:0 18px 50px rgba(15,29,39,.35)}
+  .modal h3{margin:0 0 14px;font:600 14px var(--sans);color:var(--ink)}
+  .mfield{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+  .mfield label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .mfield input[type=text],.mfield select{font:13px var(--sans);padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
+  .mfield input:focus,.mfield select:focus{outline:2px solid var(--lime);outline-offset:1px}
+  .mfield.chk label{display:flex;gap:7px;align-items:center;font:12.5px var(--sans);color:var(--ink);text-transform:none;letter-spacing:0;cursor:pointer}
+  .mactions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+
+  .statusline{
+    flex:none;display:flex;gap:18px;align-items:center;
+    font-family:var(--mono);font-size:11px;color:var(--muted);
+    padding:7px 20px;border-top:1px solid var(--line);background:#fff;
+  }
+
+  /* ---- Projectworks user picker in the brand band ---- */
+  .who{display:flex;align-items:center;gap:7px}
+  .who label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#8FA3AD}
+  .who select{
+    font:12.5px var(--sans);width:220px;padding:5px 26px 5px 9px;color:#E8EEF1;
+    background:var(--navy-2);border:1px solid #2A3E4A;border-radius:6px;
+    appearance:none;-webkit-appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238FA3AD' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 9px center;background-size:10px 6px;
+  }
+  .who select:focus{outline:2px solid var(--lime);outline-offset:1px}
+  .who select:disabled{opacity:.65}
+
+  /* ---- supplier sub-rows (Consultant tab) ---- */
+  button.tw{
+    font:11px var(--mono);border:0;background:none;cursor:pointer;color:var(--muted);
+    width:18px;padding:0;margin-right:4px;vertical-align:baseline;
+  }
+  button.tw:hover{color:var(--ink)}
+  tr.subrow td{background:#F7FAF0;color:var(--muted)}
+  tr.subrow td.txt .supname{color:var(--ink)}
+  tr.subrow:hover td{background:var(--cell-hover)}
+  td.rolled{color:var(--muted)}
+  td.rolled small{font-family:var(--mono);font-size:9px;letter-spacing:.08em;color:var(--lime-ink);margin-left:5px}
+  button.addsup{
+    font:500 12px var(--sans);border:0;background:none;cursor:pointer;
+    color:var(--lime-ink);padding:0;
+  }
+  button.addsup:hover{text-decoration:underline}
+
+  /* ---- audit tab ---- */
+  #auditwrap td,#auditwrap th{text-align:left}
+  #auditwrap td.num{text-align:right}
+  .audit-note{
+    font-family:var(--mono);font-size:11px;color:var(--muted);
+    padding:10px 20px;border-bottom:1px solid var(--line);background:#fff;
+  }
+  td.sync-ok{color:var(--lime-ink);font-weight:700}
+  td.sync-fail{color:var(--red);font-weight:700;cursor:help}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">P</div>
+  <div class="brand">Projectworks<small>Billing Forecast</small></div>
+  <div class="spacer"></div>
+  <div class="who">
+    <label for="u-select">User</label>
+    <select id="u-select"><option value="">Loading users...</option></select>
+  </div>
+  <div class="chip tenant" id="chip-env" title="Connecting to the Projectworks Open API…">
+    <span class="tlabel">Tenant</span><span class="tname" id="chip-tenant">connecting…</span>
+  </div>
+  <div class="chip" id="chip-writes">writes: —</div>
+  <div class="chip sync" id="chip-sync">synced —</div>
+</header>
+
+<div class="toolbar">
+  <div class="field">
+    <label for="f-start">Forecast start</label>
+    <div class="mpick">
+      <button type="button" class="mpick-btn" id="f-start" aria-haspopup="dialog" aria-expanded="false">Any month</button>
+    </div>
+  </div>
+  <div class="field">
+    <label for="f-end">Forecast end</label>
+    <div class="mpick">
+      <button type="button" class="mpick-btn" id="f-end" aria-haspopup="dialog" aria-expanded="false">Any month</button>
+    </div>
+  </div>
+  <div class="field">
+    <label for="f-pm">Project manager</label>
+    <select id="f-pm"><option value="">All PMs</option></select>
+  </div>
+  <div class="field">
+    <label for="f-type" title="Approximates BQE/Deltek's Class filter using Project Type — not a literal field match.">Project type</label>
+    <select id="f-type"><option value="">All types</option></select>
+  </div>
+  <div class="field">
+    <label for="f-q">Search</label>
+    <input type="search" id="f-q" placeholder="Project or stage">
+  </div>
+  <div class="checks">
+    <label><input type="checkbox" id="f-inactive"> Show inactive stages</label>
+    <label><input type="checkbox" id="f-hidezero"> Hide $0 fee stages</label>
+    <label><input type="checkbox" id="f-noforecast" title="Stages with fee remaining but no forecast entries in the selected range."> Remaining fees &amp; no forecast</label>
+  </div>
+  <div class="spacer"></div>
+  <button class="ghost" id="btn-export">Export CSV</button>
+  <button class="primary" id="btn-load">Load data</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="gross">Gross fees<span class="n" id="n-gross"></span></button>
+  <button class="tab" data-tab="consultant">Consultant fees<span class="n" id="n-consultant"></span></button>
+  <button class="tab" data-tab="audit">Audit</button>
+</div>
+
+<div class="notice hidden" id="notice-readonly">
+  Read-only mode: forecast edits are disabled on this server (ALLOW_WRITES=false).
+</div>
+<div class="notice hidden" id="notice-status">
+  <b>Fees to Date is unfiltered.</b> INVOICE_STATUS_CODES is not set, so every invoice status is counted —
+  including drafts and unapproved invoices. Set it to the approved status code(s) for this tenant before
+  trusting or demoing these revenue figures.
+</div>
+
+<div class="gridwrap" id="gridwrap">
+  <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, invoiced-to-date and forecasts from Projectworks.</div>
+  <table id="grid" class="hidden">
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+    <tfoot><tr id="foot"></tr></tfoot>
+  </table>
+</div>
+
+<div class="gridwrap hidden" id="auditwrap">
+  <div class="audit-note">Preview — full audit reporting ships in the production build</div>
+  <table>
+    <thead><tr>
+      <th class="txt">Time</th><th class="txt">User</th><th class="txt">Action</th>
+      <th class="txt">Project</th><th class="txt">Stage</th><th class="txt">Supplier</th>
+      <th class="txt">Month</th><th>From → To</th><th class="txt">Synced</th>
+    </tr></thead>
+    <tbody id="audit-body"></tbody>
+  </table>
+  <div class="empty hidden" id="audit-empty">No audit entries yet — edit a forecast cell to create one.</div>
+</div>
+
+<div class="statusline">
+  <span id="s-rows">0 rows</span>
+  <span id="s-meta"></span>
+  <span class="spacer"></span>
+  <span id="s-host"></span>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal-back hidden" id="colmodal" role="dialog" aria-modal="true" aria-labelledby="cm-h">
+  <div class="modal">
+    <h3 id="cm-h">Column settings</h3>
+    <div class="mfield">
+      <label for="cm-title">Column title</label>
+      <input type="text" id="cm-title">
+    </div>
+    <div class="mfield">
+      <label for="cm-align">Align</label>
+      <select id="cm-align">
+        <option value="left">Left</option>
+        <option value="center">Center</option>
+        <option value="right">Right</option>
+      </select>
+    </div>
+    <div class="mfield chk">
+      <label><input type="checkbox" id="cm-wrap"> Wrap text</label>
+    </div>
+    <div class="mfield">
+      <label for="cm-display">Display as</label>
+      <select id="cm-display">
+        <option value="auto">Automatic</option>
+        <option value="currency">Currency</option>
+        <option value="percentage">Percentage</option>
+        <option value="number">Number</option>
+      </select>
+    </div>
+    <div class="mactions">
+      <button class="ghost" id="cm-cancel">Cancel</button>
+      <button class="primary" id="cm-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    rows: [],
+    supplierLines: [],  // app-side lines from data/store.json, via the server
+    expanded: new Set(), // moduleIDs with supplier sub-rows open (Consultant tab)
+    months: [],       // ['2026-07', ...]
+    tab: 'gross',
+    writes: false,
+    loaded: false,
+    appBase: '',    // PW_APP_BASE_URL from /api/health; '' = render plain text, no links
+    sort: { key: null, dir: null }, // dir: 'asc', 'desc', or null
+    cols: [],       // ordered column defs for the current render
+    viewRows: [],   // filtered rows backing the current tbody (data-row indexes point here)
+    colMeta: {},    // per-column {name, align, wrap, displayAs}, persisted
+    savedOrder: null, // persisted column-key order
+    users: [],
+    selectedUser: null,
+    editingColKey: null,
+    draggingColKey: null,
+    suppressHeaderClick: false,
+  };
+  const SELECTED_USER_KEY = 'pw-billing-forecast-selected-user';
+  const COLUMN_ORDER_KEY = 'pw-billing-forecast-column-order';
+  const COLUMN_METADATA_KEY = 'pw-billing-forecast-column-metadata';
+
+  function readStoredJSON(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeStoredJSON(key, value) {
+    localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  function initColumnPrefs() {
+    const meta = readStoredJSON(COLUMN_METADATA_KEY, {});
+    const order = readStoredJSON(COLUMN_ORDER_KEY, null);
+    state.colMeta = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+    state.savedOrder = Array.isArray(order) ? order : null;
+  }
+
+  async function initUserPicker() {
+    const select = $('u-select');
+    const saved = localStorage.getItem(SELECTED_USER_KEY) || '';
+    select.disabled = true;
+    select.innerHTML = '<option value="">Loading users...</option>';
+    try {
+      const r = await fetch('/api/users');
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      state.users = Array.isArray(data.users) ? data.users : [];
+      renderUserOptions(saved);
+    } catch (e) {
+      state.users = [];
+      state.selectedUser = null;
+      select.innerHTML = '<option value="">Unable to load users</option>';
+      toast('User load failed: ' + e.message, true);
+    } finally {
+      select.disabled = false;
+    }
+
+    select.addEventListener('change', () => {
+      const user = state.users.find(u => String(u.id) === select.value) || null;
+      state.selectedUser = user;
+      if (user) localStorage.setItem(SELECTED_USER_KEY, String(user.id));
+      else localStorage.removeItem(SELECTED_USER_KEY);
+    });
+  }
+
+  function renderUserOptions(selectedID) {
+    const select = $('u-select');
+    select.innerHTML = '<option value="">Select a user...</option>' + state.users.map(u => {
+      const label = u.email ? `${u.name} (${u.email})` : u.name;
+      return `<option value="${esc(u.id)}">${esc(label)}</option>`;
+    }).join('');
+    select.value = state.users.some(u => String(u.id) === String(selectedID)) ? String(selectedID) : '';
+    state.selectedUser = state.users.find(u => String(u.id) === select.value) || null;
+    if (!state.selectedUser) localStorage.removeItem(SELECTED_USER_KEY);
+  }
+
+  function selectedUserPayload() {
+    if (!state.selectedUser) return null;
+    return {
+      selectedProjectworksUserID: state.selectedUser.id,
+      selectedProjectworksUserName: state.selectedUser.name,
+    };
+  }
+
+  function requireSelectedUser() {
+    if (state.selectedUser) return true;
+    toast('Select a user before editing.', true);
+    return false;
+  }
+
+  const linesFor = (moduleID) => state.supplierLines.filter(l => l.moduleID === moduleID);
+
+  // ---- custom month picker ---------------------------------------------
+  // Replaces <input type="month">: a compact dropdown anchored directly
+  // beneath its control (year list + Jan–Dec grid + Clear / This month),
+  // closing on outside click and Escape, arrow-key navigable.
+  const MONTHS_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  let openPicker = null; // at most one popup open at a time
+
+  function createMonthPicker(btnId) {
+    const btn = $(btnId);
+    const wrap = btn.parentElement;
+    let value = ''; // 'YYYY-MM' or ''
+    let pop = null;
+    let viewYear = new Date().getFullYear();
+
+    const api = {
+      get value() { return value; },
+      set value(v) { value = v || ''; paintBtn(); },
+      close,
+    };
+
+    function paintBtn() {
+      if (value) {
+        const [y, m] = value.split('-').map(Number);
+        btn.textContent = MONTHS_ABBR[m - 1] + ' ' + y;
+        btn.classList.remove('empty');
+      } else {
+        btn.textContent = 'Any month';
+        btn.classList.add('empty');
+      }
+    }
+
+    function close(focusBack) {
+      if (!pop) return;
+      pop.remove();
+      pop = null;
+      btn.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('pointerdown', onDocDown, true);
+      if (openPicker === api) openPicker = null;
+      if (focusBack) btn.focus();
+    }
+
+    function onDocDown(e) {
+      if (!wrap.contains(e.target)) close(false);
+    }
+
+    function open() {
+      if (pop) { close(true); return; }
+      if (openPicker) openPicker.close(false);
+      viewYear = value ? Number(value.slice(0, 4)) : new Date().getFullYear();
+      pop = document.createElement('div');
+      pop.className = 'mpick-pop';
+      pop.setAttribute('role', 'dialog');
+      pop.setAttribute('aria-label', 'Choose month');
+      renderPop();
+      wrap.appendChild(pop);
+      btn.setAttribute('aria-expanded', 'true');
+      document.addEventListener('pointerdown', onDocDown, true);
+      openPicker = api;
+      (pop.querySelector('.mo.sel') || pop.querySelector('.mo')).focus();
+    }
+
+    function renderPop() {
+      const curYear = new Date().getFullYear();
+      const years = [];
+      for (let y = Math.min(viewYear, curYear - 3); y <= Math.max(viewYear, curYear + 4); y++) years.push(y);
+      const selY = value ? Number(value.slice(0, 4)) : null;
+      const selM = value ? Number(value.slice(5, 7)) : null;
+      pop.innerHTML =
+        '<div class="mpick-cols">' +
+          '<div class="mpick-years">' + years.map(y =>
+            `<button type="button" class="yr${y === viewYear ? ' sel' : ''}" data-y="${y}">${y}</button>`).join('') + '</div>' +
+          '<div class="mpick-months" role="grid">' + MONTHS_ABBR.map((mn, i) =>
+            `<button type="button" class="mo${selY === viewYear && selM === i + 1 ? ' sel' : ''}" data-m="${i + 1}">${mn}</button>`).join('') + '</div>' +
+        '</div>' +
+        '<div class="mpick-foot">' +
+          '<button type="button" class="lnk" data-act="clear">Clear</button>' +
+          '<button type="button" class="lnk" data-act="now">This month</button>' +
+        '</div>';
+      pop.querySelectorAll('.yr').forEach(b => b.addEventListener('click', () => {
+        viewYear = Number(b.dataset.y);
+        renderPop();
+        (pop.querySelector('.mo.sel') || pop.querySelector('.mo')).focus();
+      }));
+      pop.querySelectorAll('.mo').forEach(b => b.addEventListener('click', () => {
+        api.value = `${viewYear}-${String(b.dataset.m).padStart(2, '0')}`;
+        close(true);
+      }));
+      pop.querySelector('[data-act=clear]').addEventListener('click', () => { api.value = ''; close(true); });
+      pop.querySelector('[data-act=now]').addEventListener('click', () => { api.value = ym(new Date()); close(true); });
+      pop.addEventListener('keydown', onPopKeys);
+      const ys = pop.querySelector('.yr.sel');
+      if (ys) ys.scrollIntoView({ block: 'nearest' });
+    }
+
+    function onPopKeys(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); close(true); return; }
+      const months = [...pop.querySelectorAll('.mo')];
+      const idx = months.indexOf(document.activeElement);
+      if (e.key === 'PageUp' || e.key === 'PageDown') {
+        e.preventDefault();
+        viewYear += e.key === 'PageUp' ? -1 : 1;
+        renderPop();
+        if (idx >= 0) pop.querySelectorAll('.mo')[idx].focus();
+        return;
+      }
+      if (idx === -1) return;
+      const move = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -3, ArrowDown: 3 }[e.key];
+      if (move != null) {
+        e.preventDefault();
+        months[Math.min(11, Math.max(0, idx + move))].focus();
+      }
+    }
+
+    btn.addEventListener('click', open);
+    btn.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown' && !pop) { e.preventDefault(); open(); }
+      if (e.key === 'Escape' && pop) { e.preventDefault(); close(true); }
+    });
+    paintBtn();
+    return api;
+  }
+
+  // ---- init ----------------------------------------------------------
+  const now = new Date();
+  const ym = (d) => d.toISOString().slice(0, 7);
+  const startPick = createMonthPicker('f-start');
+  const endPick = createMonthPicker('f-end');
+  
+  initColumnPrefs();
+  initUserPicker();
+
+  startPick.value = ym(new Date(now.getFullYear(), now.getMonth(), 15));
+  endPick.value = ym(new Date(now.getFullYear(), now.getMonth() + 11, 15));
+
+  fetch('/api/health').then(r => r.json()).then(h => {
+    // The API host is the same for every tenant including production, so the
+    // chip names the tenant the server locked onto; the host is secondary.
+    const host = (() => { try { return new URL(h.baseUrl).host; } catch { return h.baseUrl || ''; } })();
+    const chip = $('chip-env');
+    if (h.tenant) {
+      $('chip-tenant').textContent = h.tenant;
+      chip.title = `Projectworks tenant "${h.tenant}" · API host ${host}`;
+      chip.classList.add('on');
+    } else {
+      // The server refuses to start without a confirmed tenant, so this only
+      // shows if it is serving an older build — say so rather than imply a match.
+      $('chip-tenant').textContent = 'unknown';
+      chip.title = `Server did not report a tenant · API host ${host}`;
+      chip.classList.add('bad');
+    }
+    $('s-host').textContent = host;
+    state.writes = !!h.writesEnabled;
+    state.appBase = (h.appBaseUrl || '').replace(/\/+$/, '');
+    $('chip-writes').textContent = 'writes: ' + (state.writes ? 'on' : 'off');
+    if (state.writes) $('chip-writes').classList.add('on');
+    $('notice-readonly').classList.toggle('hidden', state.writes);
+    // Raise the unfiltered-fees banner immediately, not only after a data load.
+    $('notice-status').classList.toggle('hidden', h.invoiceStatusFiltered !== false);
+  }).catch(() => {
+    $('chip-tenant').textContent = 'server unreachable';
+    $('chip-env').classList.add('bad');
+  });
+
+  // ---- helpers -------------------------------------------------------
+  const fmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const money = (n) => (n === 0 || n) ? fmt.format(n) : '';
+  // Deep link into the Projectworks web app; plain text when PW_APP_BASE_URL is unset.
+  const pwLink = (path, inner, title) => state.appBase
+    ? `<a class="pwl" href="${state.appBase}${path}" target="_blank" rel="noopener" title="${title}">${inner}</a>`
+    : inner;
+  const monthLabel = (k) => {
+    const [y, m] = k.split('-').map(Number);
+    return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }).toUpperCase();
+  };
+  function monthsBetween(a, b) {
+    const out = [];
+    let [y, m] = a.split('-').map(Number);
+    const [ey, em] = b.split('-').map(Number);
+    while (y < ey || (y === ey && m <= em)) {
+      out.push(`${y}-${String(m).padStart(2, '0')}`);
+      m++; if (m > 12) { m = 1; y++; }
+      if (out.length > 36) break; // sanity cap
+    }
+    return out;
+  }
+  function toast(msg, err = false) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.toggle('err', err);
+    t.classList.add('show');
+    clearTimeout(t._h);
+    t._h = setTimeout(() => t.classList.remove('show'), err ? 5000 : 2200);
+  }
+  function tickSync() {
+    const c = $('chip-sync');
+    c.textContent = 'synced ' + new Date().toLocaleTimeString();
+    c.classList.add('flash');
+    setTimeout(() => c.classList.remove('flash'), 900);
+  }
+
+  // ---- load ----------------------------------------------------------
+  async function load() {
+    const start = startPick.value, end = endPick.value;
+    if (!start || !end || end < start) { toast('Set a valid forecast range first.', true); return; }
+    const btn = $('btn-load');
+    btn.disabled = true; btn.textContent = 'Loading…';
+    try {
+      const r = await fetch(`/api/grid?start=${start}&end=${end}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      state.rows = data.rows;
+      state.supplierLines = data.supplierLines || [];
+      state.months = monthsBetween(start, end);
+      state.loaded = true;
+      $('s-meta').textContent =
+        `${data.meta.projects} projects · ${data.meta.modules} stages · ` +
+        `${data.meta.invoices} invoices · ${data.meta.forecastEntries} forecast entries`;
+      $('notice-status').classList.toggle('hidden',
+        !(typeof data.meta.invoiceStatusFilter === 'string')); // string = unfiltered warning
+      buildPmFilter();
+      render();
+      toast('Loaded from Projectworks.');
+      tickSync();
+    } catch (e) {
+      toast('Load failed: ' + e.message, true);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Load data';
+    }
+  }
+
+  function buildPmFilter() {
+    const sel = $('f-pm');
+    const cur = sel.value;
+    const pms = [...new Set(state.rows.map(r => r.projectManagerName).filter(Boolean))].sort();
+    sel.innerHTML = '<option value="">All PMs</option>' +
+      pms.map(p => `<option${p === cur ? ' selected' : ''}>${p}</option>`).join('');
+
+    const tsel = $('f-type');
+    const tcur = tsel.value;
+    const types = [...new Set(state.rows.map(r => r.projectType).filter(Boolean))].sort();
+    tsel.innerHTML = '<option value="">All types</option>' +
+      types.map(t => `<option${t === tcur ? ' selected' : ''}>${t}</option>`).join('');
+  }
+
+  // ---- filtering -----------------------------------------------------
+  function visibleRows() {
+    const q = $('f-q').value.trim().toLowerCase();
+    const pm = $('f-pm').value;
+    const ptype = $('f-type').value;
+    const showInactive = $('f-inactive').checked;
+    const hideZero = $('f-hidezero').checked;
+    const noForecastOnly = $('f-noforecast').checked;
+    const wantServices = state.tab === 'gross';
+    return state.rows.filter(r =>
+      r.isServices === wantServices &&
+      (showInactive || r.isActive) &&
+      (!hideZero || r.fee !== 0) &&
+      (!pm || r.projectManagerName === pm) &&
+      (!ptype || r.projectType === ptype) &&
+      (!noForecastOnly || (r.remaining !== 0 && Object.keys(r.months).length === 0)) &&
+      (!q || (r.projectName + ' ' + r.stageName + ' ' + r.parentNumber).toLowerCase().includes(q))
+    );
+  }
+
+  // ---- columns + render ------------------------------------------------
+  const numberFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
+
+  function baseColumns() {
+    const feeLabel = state.tab === 'consultant' ? 'Total Budget' : 'Fee';
+    return [
+      { key: 'stat', label: 'Stat', align: 'center', sticky: 'stick s0' },
+      { key: 'parentNumber', label: 'Parent #', text: true, align: 'left', sticky: 'stick s1' },
+      { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2' },
+      { key: 'stageNumber', label: 'Stage No.', text: true, align: 'left' },
+      { key: 'stageName', label: 'Stage Name', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageName },
+      { key: 'fee', label: feeLabel, type: 'money', align: 'right', sortable: 'number', sortValue: r => r.fee },
+      { key: 'feesToDate', label: 'Fees to Date', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.feesToDate },
+      { key: 'remaining', label: 'Remaining', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.remaining },
+      ...state.months.map(k => ({ key: `month:${k}`, label: monthLabel(k), type: 'money', align: 'right', month: k })),
+    ];
+  }
+
+  function currentColumns() {
+    const defs = baseColumns();
+    const byKey = new Map(defs.map(c => [c.key, c]));
+    const seen = new Set();
+    const ordered = [];
+    const saved = Array.isArray(state.savedOrder) ? state.savedOrder : [];
+    saved.forEach(key => {
+      if (byKey.has(key) && !seen.has(key)) {
+        ordered.push(byKey.get(key));
+        seen.add(key);
+      }
+    });
+    defs.forEach(col => {
+      if (!seen.has(col.key)) ordered.push(col);
+    });
+    state.cols = ordered;
+    return ordered;
+  }
+
+  function metaFor(col) {
+    const stored = state.colMeta[col.key] || {};
+    const align = ['left', 'center', 'right'].includes(stored.align) ? stored.align : col.align || (col.text ? 'left' : 'right');
+    const displayAs = ['auto', 'currency', 'percentage', 'number'].includes(stored.displayAs) ? stored.displayAs : 'auto';
+    return {
+      name: typeof stored.name === 'string' ? stored.name : '',
+      align,
+      wrap: !!stored.wrap,
+      displayAs,
+    };
+  }
+
+  function columnLabel(col) {
+    const meta = metaFor(col);
+    return meta.name.trim() || col.label;
+  }
+
+  function styleFor(col, meta = metaFor(col)) {
+    return `text-align:${meta.align};`;
+  }
+
+  function inputStyleFor(col, meta = metaFor(col)) {
+    return `text-align:${meta.align};`;
+  }
+
+  function classesForCell(col, extra = []) {
+    const meta = metaFor(col);
+    return [col.text ? 'txt' : '', col.sticky || '', meta.wrap ? 'wrap' : '', ...extra].filter(Boolean).join(' ');
+  }
+
+  function cellAttrs(col, extra = [], more = '') {
+    const cls = classesForCell(col, extra);
+    return `data-col="${esc(col.key)}" class="${cls}" style="${styleFor(col)}"${more ? ' ' + more : ''}`;
+  }
+
+  function displayValue(value, col) {
+    if (value === '' || value == null) return '';
+    const n = Number(value);
+    const mode = metaFor(col).displayAs;
+    if (mode === 'currency' || (mode === 'auto' && col.type === 'money')) return money(n);
+    if (mode === 'percentage') return Number.isNaN(n) ? String(value) : `${numberFmt.format(n * 100)}%`;
+    if (mode === 'number' || (mode === 'auto' && col.type === 'number')) return Number.isNaN(n) ? String(value) : numberFmt.format(n);
+    return String(value);
+  }
+
+  function toneClasses(value) {
+    if (value == null || value === '') return [];
+    const n = Number(value);
+    if (Number.isNaN(n)) return [];
+    return [n < 0 ? 'neg' : '', n === 0 ? 'zero' : ''].filter(Boolean);
+  }
+
+  function cycleSort(col) {
+    if (!col.sortable) return;
+    const first = col.sortable === 'number' ? 'desc' : 'asc';
+    const second = col.sortable === 'number' ? 'asc' : 'desc';
+    if (state.sort.key !== col.key || !state.sort.dir) {
+      state.sort = { key: col.key, dir: first };
+    } else if (state.sort.dir === first) {
+      state.sort = { key: col.key, dir: second };
+    } else {
+      state.sort = { key: null, dir: null };
+    }
+    render();
+  }
+
+  function sortedRows(rows, cols) {
+    if (!state.sort.key || !state.sort.dir) return rows;
+    const col = cols.find(c => c.key === state.sort.key);
+    if (!col || !col.sortable) return rows;
+    return [...rows].sort((a, b) => {
+      const av = col.sortValue ? col.sortValue(a) : a[col.key];
+      const bv = col.sortValue ? col.sortValue(b) : b[col.key];
+      let cmp;
+      if (col.sortable === 'number') {
+        cmp = (Number(av) || 0) - (Number(bv) || 0);
+      } else {
+        cmp = String(av || '').localeCompare(String(bv || ''), undefined, { numeric: true, sensitivity: 'base' });
+      }
+      return state.sort.dir === 'asc' ? cmp : -cmp;
+    });
+  }
+
+  function headerHtml(col) {
+    const meta = metaFor(col);
+    const label = columnLabel(col);
+    const sorted = state.sort.key === col.key && state.sort.dir;
+    const sortButton = col.sortable
+      ? `<button type="button" class="sortbtn" draggable="false" data-sort="${esc(col.key)}" title="Sort ${esc(label)}">${sorted ? (state.sort.dir === 'asc' ? '▲' : '▼') : '↕'}</button>`
+      : '';
+    const cls = [col.text ? 'txt' : '', col.sticky || '', meta.wrap ? 'wrap' : '', sorted ? 'sorted' : ''].filter(Boolean).join(' ');
+    return `<th draggable="true" data-col="${esc(col.key)}" class="${cls}" style="${styleFor(col, meta)}"><span class="hcell"><span class="hlabel">${esc(label)}</span>${sortButton}</span></th>`;
+  }
+
+  function clearDropCues() {
+    document.querySelectorAll('thead th.dropcue, thead th.dragging').forEach(th => th.classList.remove('dropcue', 'dragging'));
+  }
+
+  function moveColumn(fromKey, toKey, after) {
+    if (!fromKey || !toKey || fromKey === toKey) return;
+    const keys = state.cols.map(c => c.key);
+    const from = keys.indexOf(fromKey);
+    let to = keys.indexOf(toKey);
+    if (from === -1 || to === -1) return;
+    const [moved] = keys.splice(from, 1);
+    if (from < to) to -= 1;
+    if (after) to += 1;
+    keys.splice(Math.max(0, Math.min(keys.length, to)), 0, moved);
+    state.savedOrder = keys;
+    writeStoredJSON(COLUMN_ORDER_KEY, keys);
+    render();
+  }
+
+  function wireHeaders() {
+    const head = $('head');
+    head.querySelectorAll('button.sortbtn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const col = state.cols.find(c => c.key === btn.dataset.sort);
+        if (col) cycleSort(col);
+      });
+    });
+    head.querySelectorAll('th[data-col]').forEach(th => {
+      th.addEventListener('click', (e) => {
+        if (state.suppressHeaderClick || e.target.closest('.sortbtn')) return;
+        openColumnModal(th.dataset.col);
+      });
+      th.addEventListener('dragstart', (e) => {
+        state.draggingColKey = th.dataset.col;
+        state.suppressHeaderClick = true;
+        th.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', th.dataset.col);
+      });
+      th.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        clearDropCues();
+        th.classList.add('dropcue');
+      });
+      th.addEventListener('dragleave', () => th.classList.remove('dropcue'));
+      th.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const fromKey = state.draggingColKey || e.dataTransfer.getData('text/plain');
+        const rect = th.getBoundingClientRect();
+        moveColumn(fromKey, th.dataset.col, e.clientX > rect.left + rect.width / 2);
+        clearDropCues();
+      });
+      th.addEventListener('dragend', () => {
+        clearDropCues();
+        state.draggingColKey = null;
+        setTimeout(() => { state.suppressHeaderClick = false; }, 0);
+      });
+    });
+  }
+
+  function openColumnModal(key) {
+    const col = state.cols.find(c => c.key === key);
+    if (!col) return;
+    const meta = metaFor(col);
+    state.editingColKey = key;
+    $('cm-h').textContent = 'Column settings';
+    $('cm-title').value = columnLabel(col);
+    $('cm-align').value = meta.align;
+    $('cm-wrap').checked = meta.wrap;
+    $('cm-display').value = meta.displayAs;
+    $('colmodal').classList.remove('hidden');
+    $('cm-title').focus();
+  }
+
+  function closeColumnModal() {
+    state.editingColKey = null;
+    $('colmodal').classList.add('hidden');
+  }
+
+  function saveColumnModal() {
+    const col = state.cols.find(c => c.key === state.editingColKey);
+    if (!col) return closeColumnModal();
+    const name = $('cm-title').value.trim();
+    state.colMeta[col.key] = {
+      name: name && name !== col.label ? name : '',
+      align: $('cm-align').value,
+      wrap: $('cm-wrap').checked,
+      displayAs: $('cm-display').value,
+    };
+    writeStoredJSON(COLUMN_METADATA_KEY, state.colMeta);
+    closeColumnModal();
+    render();
+  }
+
+  function renderMainCell(col, r, i, rowState) {
+    if (col.key === 'stat') {
+      return `<td ${cellAttrs(col, ['stat', r.isActive ? '' : 'inactive'])}>${esc(r.stat)}</td>`;
+    }
+    if (col.key === 'parentNumber') return `<td ${cellAttrs(col)}>${esc(r.parentNumber)}</td>`;
+    if (col.key === 'projectName') {
+      return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
+    }
+    if (col.key === 'stageNumber') return `<td ${cellAttrs(col)}>${esc(r.stageNumber)}</td>`;
+    if (col.key === 'stageName') {
+      return `<td ${cellAttrs(col)}>${rowState.toggle}${pwLink(`/Project/Budgets/${r.projectID}`, esc(r.stageName), 'Open project budgets in Projectworks')}</td>`;
+    }
+    if (col.key === 'fee') {
+      const inner = pwLink(`/Project/Forecasting/${r.projectID}`, esc(displayValue(r.fee, col)), 'Open project forecasting in Projectworks');
+      return `<td ${cellAttrs(col, toneClasses(r.fee))}>${inner}</td>`;
+    }
+    if (col.key === 'feesToDate') return `<td ${cellAttrs(col, toneClasses(r.feesToDate))}>${esc(displayValue(r.feesToDate, col))}</td>`;
+    if (col.key === 'remaining') return `<td ${cellAttrs(col, toneClasses(r.remaining))}>${esc(displayValue(r.remaining, col))}</td>`;
+    if (col.month) {
+      if (rowState.rolled) {
+        const v = r.months[col.month];
+        return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="Rolled up from ${rowState.lines.length} supplier line${rowState.lines.length === 1 ? '' : 's'}"`)}>${esc(displayValue(v, col))}</td>`;
+      }
+      const v = r.months[col.month];
+      return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-row="${i}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
+    }
+    return `<td ${cellAttrs(col)}></td>`;
+  }
+
+  function renderSupplierCell(col, line, rowIndex) {
+    if (col.key === 'stageName') {
+      return `<td ${cellAttrs(col)}>↳ <span class="supname">${esc(line.supplier)}</span></td>`;
+    }
+    if (col.month) {
+      const v = line.months[col.month];
+      return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-line="${line.id}" data-row="${rowIndex}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
+    }
+    return `<td ${cellAttrs(col, col.key === 'stat' ? ['stat'] : [])}></td>`;
+  }
+
+  function renderAddSupplierCell(col, row, rowIndex) {
+    if (col.key === 'stageName') {
+      return `<td ${cellAttrs(col)}><button class="addsup" data-mid="${row.moduleID}" data-row="${rowIndex}">+ Add supplier</button></td>`;
+    }
+    return `<td ${cellAttrs(col, col.key === 'stat' ? ['stat'] : [])}></td>`;
+  }
+
+  function renderFooterCell(col, rows) {
+    const tot = (fn) => rows.reduce((s, r) => s + fn(r), 0);
+    let value = '';
+    let label = '';
+    if (col.key === 'projectName') label = `Total · ${rows.length} stages`;
+    if (col.key === 'fee') value = tot(r => r.fee);
+    if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
+    if (col.key === 'remaining') value = tot(r => r.remaining);
+    if (col.month) value = tot(r => r.months[col.month] || 0);
+    const inner = label || esc(displayValue(value, col));
+    return `<td ${cellAttrs(col, [label ? 'txt' : '', ...toneClasses(value)])}>${inner}</td>`;
+  }
+
+  function render() {
+    if (!state.loaded || state.tab === 'audit') return;
+    const cols = currentColumns();
+    const filteredRows = visibleRows();
+    const rows = sortedRows(filteredRows, cols);
+    state.viewRows = rows;
+
+    // tab counts (unfiltered by tab, filtered by everything else)
+    const base = state.rows.filter(r =>
+      ($('f-inactive').checked || r.isActive) &&
+      (!$('f-hidezero').checked || r.fee !== 0));
+    $('n-gross').textContent = base.filter(r => r.isServices).length;
+    $('n-consultant').textContent = base.filter(r => !r.isServices).length;
+
+    $('head').innerHTML = cols.map(headerHtml).join('');
+    wireHeaders();
+
+    const body = $('body');
+    const isConsultant = state.tab === 'consultant';
+    body.innerHTML = rows.map((r, i) => {
+      const lines = isConsultant ? linesFor(r.moduleID) : [];
+      const open = isConsultant && state.expanded.has(r.moduleID);
+      const rowState = {
+        lines,
+        open,
+        rolled: lines.length > 0,
+        toggle: isConsultant
+          ? `<button class="tw" data-mid="${r.moduleID}" title="Supplier lines">${open ? '▾' : '▸'}</button>`
+          : '',
+      };
+      let html = '<tr>' + cols.map(col => renderMainCell(col, r, i, rowState)).join('') + '</tr>';
+      if (open) {
+        html += lines.map(line => '<tr class="subrow">' + cols.map(col => renderSupplierCell(col, line, i)).join('') + '</tr>').join('');
+        html += '<tr class="subrow">' + cols.map(col => renderAddSupplierCell(col, r, i)).join('') + '</tr>';
+      }
+      return html;
+    }).join('');
+
+    body.querySelectorAll('td.mcell input').forEach(inp => {
+      inp.addEventListener('focus', () => { inp.dataset.prev = inp.value; });
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') inp.blur(); if (e.key === 'Escape') { inp.value = inp.dataset.prev; inp.blur(); } });
+      inp.addEventListener('blur', () => inp.dataset.line ? commitSupplierCell(inp, rows) : commitCell(inp, rows));
+    });
+    body.querySelectorAll('button.tw').forEach(b =>
+      b.addEventListener('click', () => {
+        const mid = Number(b.dataset.mid);
+        state.expanded.has(mid) ? state.expanded.delete(mid) : state.expanded.add(mid);
+        render();
+      }));
+    body.querySelectorAll('button.addsup').forEach(b =>
+      b.addEventListener('click', () => addSupplier(Number(b.dataset.mid), rows[Number(b.dataset.row)])));
+
+    $('foot').innerHTML = cols.map(col => renderFooterCell(col, filteredRows)).join('');
+
+    $('grid').classList.remove('hidden');
+    $('empty').classList.add('hidden');
+    $('s-rows').textContent = filteredRows.length + ' rows';
+  }
+
+  async function commitCell(inp, rows) {
+    const prev = inp.dataset.prev ?? '';
+    const raw = inp.value.trim().replace(/,/g, '');
+    if (raw === prev.trim()) return;                 // no change
+    if (raw !== '' && Number.isNaN(Number(raw))) {   // not a number
+      inp.value = prev; return;
+    }
+    if (!requireSelectedUser()) { inp.value = prev; return; }
+    const userPayload = selectedUserPayload();
+    const row = rows[Number(inp.dataset.row)];
+    const month = inp.dataset.month;
+    const amount = raw === '' ? 0 : Number(raw);
+    const td = inp.closest('td');
+    try {
+      const r = await fetch('/api/forecast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          moduleID: row.moduleID,
+          month,
+          amount,
+          ...userPayload,
+          context: {
+            stage: row.stageName,
+            project: row.projectName,
+            from: prev.trim() === '' ? '' : Number(prev.replace(/,/g, '')),
+          },
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      row.months[month] = amount;
+      td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
+      tickSync();
+      renderFooterOnly(rows);
+    } catch (e) {
+      inp.value = prev;
+      td.classList.remove('failed'); void td.offsetWidth; td.classList.add('failed');
+      toast('Sync failed: ' + e.message, true);
+    }
+  }
+
+  async function commitSupplierCell(inp, rows) {
+    const prev = inp.dataset.prev ?? '';
+    const raw = inp.value.trim().replace(/,/g, '');
+    if (raw === prev.trim()) return;                 // no change
+    if (raw !== '' && Number.isNaN(Number(raw))) {   // not a number
+      inp.value = prev; return;
+    }
+    if (!requireSelectedUser()) { inp.value = prev; return; }
+    const userPayload = selectedUserPayload();
+    const line = state.supplierLines.find(l => l.id === Number(inp.dataset.line));
+    const row = rows[Number(inp.dataset.row)];
+    const month = inp.dataset.month;
+    const amount = raw === '' ? 0 : Number(raw);
+    const td = inp.closest('td');
+    try {
+      const r = await fetch(`/api/supplier-lines/${line.id}/month`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          month,
+          amount,
+          ...userPayload,
+          context: {
+            stage: row.stageName,
+            project: row.projectName,
+            from: prev.trim() === '' ? '' : Number(prev.replace(/,/g, '')),
+            moduleFrom: row.months[month] ?? '',
+          },
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      line.months[month] = amount;
+      row.months[month] = data.moduleTotal;
+      td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
+      if (data.syncedToProjectworks === false) {
+        toast('Saved locally, but the Projectworks rollup failed: ' + (data.syncError || ''), true);
+      } else {
+        tickSync();
+      }
+      const rolledCell = $('body').querySelector(`td.rolled[data-mid="${row.moduleID}"][data-month="${month}"]`);
+      if (rolledCell) {
+        const monthCol = state.cols.find(c => c.month === month) || { key: `month:${month}`, type: 'money', align: 'right' };
+        rolledCell.textContent = displayValue(row.months[month], monthCol);
+        rolledCell.classList.remove('neg', 'zero');
+        toneClasses(row.months[month]).forEach(cls => rolledCell.classList.add(cls));
+        rolledCell.classList.toggle('zero', row.months[month] === 0);
+      }
+      renderFooterOnly(rows);
+    } catch (e) {
+      inp.value = prev;
+      td.classList.remove('failed'); void td.offsetWidth; td.classList.add('failed');
+      toast('Sync failed: ' + e.message, true);
+    }
+  }
+
+  async function addSupplier(moduleID, row) {
+    if (!state.writes) { toast('Writes are disabled on this server.', true); return; }
+    if (!requireSelectedUser()) return;
+    const userPayload = selectedUserPayload();
+    const name = prompt('Supplier name:');
+    if (!name || !name.trim()) return;
+    try {
+      const r = await fetch('/api/supplier-lines', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          moduleID,
+          supplier: name.trim(),
+          ...userPayload,
+          context: { stage: row.stageName, project: row.projectName },
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      state.supplierLines.push(data.line);
+      render();
+      toast(`Supplier "${data.line.supplier}" added.`);
+      tickSync();
+    } catch (e) {
+      toast('Add supplier failed: ' + e.message, true);
+    }
+  }
+
+  // ---- audit tab -------------------------------------------------------
+  async function loadAudit() {
+    try {
+      const r = await fetch('/api/audit');
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      const entries = data.audit || [];
+      $('audit-empty').classList.toggle('hidden', entries.length > 0);
+      const amt = (v) => (v === '' || v == null) ? '—' : money(Number(v));
+      $('audit-body').innerHTML = entries.map(a => '<tr>' +
+        `<td class="txt">${esc(new Date(a.time).toLocaleString())}</td>` +
+        `<td class="txt">${esc(a.user)}</td>` +
+        `<td class="txt">${esc(a.action)}</td>` +
+        `<td class="txt">${esc(a.project)}</td>` +
+        `<td class="txt">${esc(a.stage)}</td>` +
+        `<td class="txt">${esc(a.supplier || '')}</td>` +
+        `<td class="txt">${esc(a.month || '')}</td>` +
+        `<td class="num">${amt(a.from)} → ${amt(a.to)}</td>` +
+        (a.synced
+          ? '<td class="txt sync-ok">✓</td>'
+          : `<td class="txt sync-fail" title="${esc(a.error || 'sync failed')}">✗</td>`) +
+        '</tr>').join('');
+      $('s-rows').textContent = entries.length + ' audit entries';
+    } catch (e) {
+      toast('Audit load failed: ' + e.message, true);
+    }
+  }
+
+  function renderFooterOnly(rows) {
+    // cheap refresh of totals after an edit without rebuilding inputs
+    const foot = $('foot');
+    const tot = (fn) => rows.reduce((s, r) => s + fn(r), 0);
+    foot.querySelectorAll('td[data-col]').forEach(cell => {
+      const col = state.cols.find(c => c.key === cell.dataset.col);
+      if (!col) return;
+      let value = null;
+      if (col.key === 'fee') value = tot(r => r.fee);
+      if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
+      if (col.key === 'remaining') value = tot(r => r.remaining);
+      if (col.month) value = tot(r => r.months[col.month] || 0);
+      if (value == null) return;
+      cell.textContent = displayValue(value, col);
+      cell.classList.remove('neg', 'zero');
+      toneClasses(value).forEach(cls => cell.classList.add(cls));
+    });
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // ---- export --------------------------------------------------------
+  function exportCsv() {
+    if (!state.loaded) { toast('Load data first.', true); return; }
+    const cols = currentColumns();
+    const rows = sortedRows(visibleRows(), cols);
+    const heads = cols.map(columnLabel);
+    const csvCell = (v) => {
+      const s = String(v ?? '');
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const valueFor = (col, r) => {
+      if (col.month) return r.months[col.month] ?? '';
+      return r[col.key] ?? '';
+    };
+    const lines = [heads.map(csvCell).join(',')].concat(rows.map(r =>
+      cols.map(col => valueFor(col, r)).map(csvCell).join(',')));
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `billing-forecast-${state.tab}-${startPick.value}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ---- events --------------------------------------------------------
+  $('btn-load').addEventListener('click', load);
+  $('btn-export').addEventListener('click', exportCsv);
+  $('cm-save').addEventListener('click', saveColumnModal);
+  $('cm-cancel').addEventListener('click', closeColumnModal);
+  $('colmodal').addEventListener('click', (e) => {
+    if (e.target === $('colmodal')) closeColumnModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('colmodal').classList.contains('hidden')) closeColumnModal();
+  });
+  ['f-q', 'f-pm', 'f-type', 'f-inactive', 'f-hidezero', 'f-noforecast'].forEach(id =>
+    $(id).addEventListener('input', render));
+  document.querySelectorAll('.tab').forEach(b =>
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      state.tab = b.dataset.tab;
+      const audit = state.tab === 'audit';
+      $('auditwrap').classList.toggle('hidden', !audit);
+      $('gridwrap').classList.toggle('hidden', audit);
+      if (audit) loadAudit(); else render();
+    }));
+})();
+</script>
+</body>
+</html>
