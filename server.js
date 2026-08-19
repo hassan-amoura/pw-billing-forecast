@@ -9,16 +9,33 @@
  * Endpoints:
  *   GET  /api/health              — config sanity check for the UI
  *   GET  /api/users               — safe Projectworks user picker data
- *   GET  /api/grid?start&end      — { rows, supplierLines, meta }
+ *   GET  /api/grid?start&end      — { rows, netRows, supplierLines, meta }
+ *                                   netRows is the read-only Net position view:
+ *                                   one row per project, planned invoicing minus
+ *                                   subconsultant fees, per month.
  *   POST /api/forecast            — { moduleID, month:"YYYY-MM", amount, selectedProjectworksUserID, context }
- *                                   → POST /api/v1/Forecasts/Set
+ *                                   → POST /api/v1/Forecasts/Set. SERVICES
+ *                                   MODULES ONLY: a non-services (consultant)
+ *                                   module is rejected, see below.
  *   GET  /api/supplier-lines      — app-side supplier lines (data/store.json)
  *   POST /api/supplier-lines      — { moduleID, supplier, selectedProjectworksUserID, context }
  *   PUT  /api/supplier-lines/:id/month — { month, amount, selectedProjectworksUserID, context }
- *                                   sets the line's month cell, then rolls the
- *                                   module's month total up to Projectworks
+ *                                   sets the line's month cell, app-side only
  *   DELETE /api/supplier-lines/:id
  *   GET  /api/audit               — newest audit entries (max 100)
+ *
+ * Two kinds of number, two homes:
+ *
+ *   Gross fees (services modules)      — what the customer plans to INVOICE its
+ *     clients. Projectworks Forecasts is the field of record; this app reads
+ *     and writes it through POST /api/v1/Forecasts/Set.
+ *
+ *   Consultant fees (non-services)     — subconsultant fees the customer expects
+ *     to be CHARGED. Planning numbers only. They live in data/store.json and
+ *     are NEVER written to Projectworks: the Forecast screen represents money
+ *     coming in, and an incoming cost posted there misstates it. There is
+ *     exactly one caller of pwSetForecast(), the /api/forecast route, and it
+ *     refuses any module that is not IsServices.
  *
  * All mutations (forecast AND supplier-line) are blocked unless
  * ALLOW_WRITES=true.
@@ -146,29 +163,73 @@ function requireBasicAuth(req, res, next) {
 }
 
 // ---- app-side store (supplier lines + audit) ------------------------------
-// Projectworks has no supplier grain in forecasts, so supplier lines live
-// here; the module-level rollup is what syncs to Projectworks.
-// data/ is not committed and a redeploy wipes it, so the store self-heals from
-// the committed seed.json at the project root.
-const DATA_DIR = path.join(__dirname, 'data');
+// Projectworks has no supplier grain in forecasts, and subconsultant fees are
+// incoming costs that do not belong on the Forecast screen at all, so supplier
+// lines and their module totals live here and are NEVER written to
+// Projectworks. This file is the system of record for that data: nothing
+// upstream can rebuild it.
+//
+// DATA_DIR must therefore point at storage that survives a redeploy. It
+// defaults to ./data for local development; a hosted deployment must set it to
+// a mounted volume, or the only copy of the data is destroyed on every deploy.
+const DATA_DIR_ENV = (process.env.DATA_DIR || '').trim();
+const DATA_DIR = DATA_DIR_ENV ? path.resolve(DATA_DIR_ENV) : path.join(__dirname, 'data');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 const SEED_PATH = path.join(__dirname, 'seed.json');
 
-/** Normalise a parsed store so a truncated or hand-edited file can't crash a route. */
-function normalizeStore(raw) {
-  const supplierLines = Array.isArray(raw?.supplierLines) ? raw.supplierLines : [];
-  const audit = Array.isArray(raw?.audit) ? raw.audit : [];
-  const maxID = supplierLines.reduce((m, l) => Math.max(m, Number(l?.id) || 0), 0);
-  const declared = Number(raw?.nextLineID) || 0;
-  return { nextLineID: Math.max(declared, maxID + 1), supplierLines, audit };
+// seed.json holds demo suppliers pinned to a demo moduleID. Seeding is opt-in
+// and off by default so that demo data can never appear in a customer
+// deployment; without it a brand new store starts empty.
+const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
+
+/** Thrown when store.json exists but cannot be read or parsed. Never swallowed. */
+class StoreCorruptError extends Error {
+  constructor(cause) {
+    super(`${STORE_PATH} exists but could not be read as JSON: ${cause}`);
+    this.name = 'StoreCorruptError';
+    this.code = 'ESTORECORRUPT';
+  }
 }
 
+/**
+ * Shape a parsed store. Only the id counter is repaired; the arrays are NOT
+ * coerced — a supplierLines that is not an array means the file is damaged,
+ * and silently substituting [] would destroy it on the next save.
+ */
+function normalizeStore(raw) {
+  if (!raw || typeof raw !== 'object') throw new StoreCorruptError('top level is not an object');
+  if (!Array.isArray(raw.supplierLines)) throw new StoreCorruptError('supplierLines is not an array');
+  if (!Array.isArray(raw.audit)) throw new StoreCorruptError('audit is not an array');
+  const maxID = raw.supplierLines.reduce((m, l) => Math.max(m, Number(l?.id) || 0), 0);
+  const declared = Number(raw.nextLineID) || 0;
+  return {
+    ...(raw.initialisedAt ? { initialisedAt: raw.initialisedAt } : {}),
+    nextLineID: Math.max(declared, maxID + 1),
+    supplierLines: raw.supplierLines,
+    audit: raw.audit,
+  };
+}
+
+/**
+ * The store as it is on disk. Returns null only when the file is ABSENT.
+ * Anything else — unreadable, truncated, malformed — throws, so no caller can
+ * mistake damage for emptiness and overwrite it.
+ */
 function readStoreFile() {
+  let text;
   try {
-    return normalizeStore(JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')));
-  } catch {
-    return null;
+    text = fs.readFileSync(STORE_PATH, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw new StoreCorruptError(err.message);
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new StoreCorruptError(err.message);
+  }
+  return normalizeStore(parsed);
 }
 
 /** A fresh store from seed.json. Supplier lines are seeded; the audit never is. */
@@ -182,36 +243,212 @@ function seededStore() {
   }
 }
 
-function loadStore() {
-  return readStoreFile() || seededStore();
+function emptyStore() {
+  return { nextLineID: 1, supplierLines: [], audit: [] };
 }
 
+/** Throws StoreCorruptError rather than returning a fresh store over damage. */
+function loadStore() {
+  return readStoreFile() || emptyStore();
+}
+
+let tmpWriteSeq = 0;
+
+/**
+ * Atomic save: write a sibling temp file, fsync it, rename it over the target.
+ * rename(2) is atomic on POSIX, so a crash mid-write leaves the previous store
+ * intact instead of a truncated one. Never writes onto STORE_PATH directly.
+ */
 function saveStore(store) {
+  if (!store.initialisedAt) store.initialisedAt = new Date().toISOString();
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+  const tmp = path.join(DATA_DIR, `.store.json.${process.pid}.${tmpWriteSeq++}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'w');
+    fs.writeFileSync(fd, JSON.stringify(store, null, 2));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, STORE_PATH);
+  } catch (err) {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 /**
- * Boot-time store initialisation. A store that already has supplier lines is
- * left exactly as it is; anything else (missing file, unreadable file, or an
- * empty supplierLines array) is rebuilt from seed.json. An audit log that
- * survived a reseed is kept — seed.json never contributes audit entries.
+ * Serialises every load -> mutate -> save so two overlapping requests cannot
+ * interleave and lose one another's edit, audit entry or line id. Reads are
+ * not queued: the atomic save means a reader sees either the whole old file or
+ * the whole new one.
+ */
+let storeQueue = Promise.resolve();
+function withStoreLock(fn) {
+  const result = storeQueue.then(() => fn());
+  storeQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+/**
+ * Boot-time store initialisation. A store file that exists is ALWAYS kept as
+ * it is — an empty supplierLines array is a legitimate state (the user deleted
+ * their last line) and must never trigger a reseed. A file that cannot be read
+ * stops the server rather than being overwritten. Only an absent file creates
+ * anything, and it seeds demo data only when SEED_DEMO_DATA=true.
  */
 function initStore() {
-  const existing = readStoreFile();
-  if (existing && existing.supplierLines.length) {
-    console.log(`  Store:     data/store.json kept (${existing.supplierLines.length} supplier lines, ${existing.audit.length} audit entries)`);
+  let existing;
+  try {
+    existing = readStoreFile();
+  } catch (err) {
+    refuseToStart([
+      'The app-side store could not be read, and it is the ONLY copy of the',
+      'supplier lines and audit trail — nothing upstream can rebuild it.',
+      '',
+      `  ${String(err.message || err)}`,
+      '',
+      'Refusing to start rather than overwriting it. Move the damaged file',
+      'aside and restore it from a backup, then start again.',
+    ]);
+  }
+  if (existing) {
+    console.log(`  Store:     ${STORE_PATH} kept (${existing.supplierLines.length} supplier lines, ${existing.audit.length} audit entries)`);
     return;
   }
-  const seeded = seededStore();
-  if (existing) seeded.audit = existing.audit;
-  saveStore(seeded);
-  console.log(`  Store:     seeded from seed.json (${seeded.supplierLines.length} supplier lines, ${seeded.audit.length} audit entries)`);
+  const fresh = SEED_DEMO_DATA ? seededStore() : emptyStore();
+  saveStore(fresh);
+  console.log(
+    SEED_DEMO_DATA
+      ? `  Store:     no store file — SEEDED WITH DEMO DATA from seed.json (${fresh.supplierLines.length} supplier lines)`
+      : `  Store:     no store file — created empty at ${STORE_PATH}`
+  );
+}
+
+/** DATA_DIR must be writable before anything tries to save into it. */
+function checkDataDir() {
+  if (!DATA_DIR_ENV) return;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+  } catch (err) {
+    refuseToStart([
+      `DATA_DIR is set to "${DATA_DIR_ENV}" but is not writable:`,
+      '',
+      `  ${String(err.message || err)}`,
+      '',
+      'This directory holds data/store.json, the system of record for supplier',
+      'lines and the audit trail. Point DATA_DIR at a mounted, writable volume',
+      'that survives a redeploy.',
+    ]);
+  }
 }
 
 function addAudit(store, entry) {
   store.audit.push({ time: new Date().toISOString(), ...entry });
   if (store.audit.length > 5000) store.audit = store.audit.slice(-5000);
+}
+
+/**
+ * The app-side rollup: the total planned across every supplier line on a
+ * module for one month. This is the single definition — the grid read, the
+ * cell edit and the line delete all call it, so they cannot drift apart.
+ * It is a planning figure and is never sent to Projectworks.
+ */
+function moduleMonthTotal(supplierLines, moduleID, month) {
+  return supplierLines
+    .filter((l) => l.moduleID === moduleID)
+    .reduce((s, l) => s + (Number(l.months[month]) || 0), 0);
+}
+
+/**
+ * Net position: one row per PROJECT, aggregated from the stage rows the grid
+ * has already built. Deriving it from those rows rather than re-reading the
+ * sources is deliberate — the two components are then the same numbers the
+ * Gross fees and Consultant fees tabs display, by construction, and cannot
+ * drift from them.
+ *
+ *   plannedMonths     sum of month values across the project's SERVICES stages
+ *                     (Projectworks Forecasts — what the customer plans to
+ *                     invoice its clients)
+ *   consultantMonths  sum of month values across the project's NON-SERVICES
+ *                     stages (this app's store — subconsultant fees it expects
+ *                     to be charged; never read from Projectworks)
+ *   months            net = planned − consultant, per month
+ *
+ * Read-only, and no new source of truth: nothing here writes anywhere.
+ */
+function buildNetRows(rows, inWindow) {
+  const byProject = new Map();
+
+  for (const r of rows) {
+    let n = byProject.get(r.projectID);
+    if (!n) {
+      n = {
+        projectID: r.projectID,
+        parentNumber: r.parentNumber,
+        projectName: r.projectName || `Project ${r.projectID}`,
+        projectManagerName: r.projectManagerName,
+        projectType: r.projectType,
+        isActive: false,
+        servicesStages: 0,
+        consultantStages: 0,
+        plannedMonths: {},
+        consultantMonths: {},
+        months: {},
+      };
+      byProject.set(r.projectID, n);
+    }
+    if (r.isActive) n.isActive = true;
+    if (r.isServices) n.servicesStages++; else n.consultantStages++;
+
+    const bucket = r.isServices ? n.plannedMonths : n.consultantMonths;
+    for (const [month, value] of Object.entries(r.months)) {
+      if (!inWindow(month)) continue;
+      bucket[month] = (bucket[month] || 0) + (Number(value) || 0);
+    }
+  }
+
+  const out = [];
+  for (const n of byProject.values()) {
+    // Same emptiness reasoning the other tabs use for "no forecast": a project
+    // counts as having something to show when a month KEY exists, so a stage
+    // deliberately forecast at 0 still renders, and a project with neither a
+    // forecast nor a supplier line in the window is dropped rather than
+    // rendered as a row of blanks.
+    const plannedKeys = Object.keys(n.plannedMonths);
+    const consultantKeys = Object.keys(n.consultantMonths);
+    if (!plannedKeys.length && !consultantKeys.length) continue;
+
+    for (const month of new Set([...plannedKeys, ...consultantKeys])) {
+      n.months[month] = (n.plannedMonths[month] || 0) - (n.consultantMonths[month] || 0);
+    }
+    const total = (obj) => Object.values(obj).reduce((s, v) => s + (Number(v) || 0), 0);
+    n.plannedTotal = total(n.plannedMonths);
+    n.consultantTotal = total(n.consultantMonths);
+    n.netTotal = n.plannedTotal - n.consultantTotal;
+    out.push(n);
+  }
+
+  out.sort((a, b) =>
+    String(a.parentNumber).localeCompare(String(b.parentNumber)) ||
+    String(a.projectName).localeCompare(String(b.projectName))
+  );
+  return out;
+}
+
+/** Every month any supplier line on this module carries, as { 'YYYY-MM': total }. */
+function moduleMonthTotals(supplierLines, moduleID, withinMonths) {
+  const lines = supplierLines.filter((l) => l.moduleID === moduleID);
+  const out = {};
+  for (const line of lines) {
+    for (const month of Object.keys(line.months || {})) {
+      if (withinMonths && !withinMonths(month)) continue;
+      if (out[month] === undefined) out[month] = moduleMonthTotal(lines, moduleID, month);
+    }
+  }
+  return out;
 }
 
 // ---- Projectworks proxy ----------------------------------------------------
@@ -514,10 +751,69 @@ async function getProjectworksUserByID(id) {
   return user;
 }
 
+// ---- module lookup (IsServices) -------------------------------------------
+// IsServices is the single field that separates the two tabs — and the two
+// kinds of number. The UI splits on it (Gross fees = services), so the server
+// guard must use exactly the same field or the two can disagree about which
+// modules are allowed to reach Projectworks.
+const MODULE_CACHE_MS = 5 * 60 * 1000;
+let modulesCache = { at: 0, byID: new Map() };
+
+function cacheModules(modules) {
+  modulesCache = {
+    at: Date.now(),
+    byID: new Map(modules.map((m) => [String(m.ModuleID), m])),
+  };
+}
+
+async function getModuleByID(id) {
+  const wanted = String(id ?? '').trim();
+  if (!wanted) return null;
+  const fresh = modulesCache.byID.size > 0 && Date.now() - modulesCache.at < MODULE_CACHE_MS;
+  if (!fresh) {
+    cacheModules(await pwGetAll('/api/v1/Modules'));
+    return modulesCache.byID.get(wanted) || null;
+  }
+  const hit = modulesCache.byID.get(wanted);
+  if (hit) return hit;
+  // Fresh cache but a miss: the module may have been created since the pull.
+  cacheModules(await pwGetAll('/api/v1/Modules'));
+  return modulesCache.byID.get(wanted) || null;
+}
+
 function httpError(status, message) {
   const err = new Error(message);
   err.status = status;
   return err;
+}
+
+/**
+ * The gate on every write to Projectworks Forecasts. Consultant (non-services)
+ * modules carry subconsultant costs, which are planning numbers held in this
+ * app and must never be posted to a screen that represents money coming in.
+ *
+ * Fails closed: a module that cannot be resolved — unknown id, or the Modules
+ * call failing — is refused, never assumed to be services.
+ */
+async function assertServicesModule(moduleID) {
+  let module;
+  try {
+    module = await getModuleByID(moduleID);
+  } catch (err) {
+    throw httpError(502, `Module ${moduleID} could not be checked against Projectworks, so nothing was written: ${String(err.message || err)}`);
+  }
+  if (!module) {
+    throw httpError(400, `Module ${moduleID} was not found in Projectworks, so nothing was written.`);
+  }
+  if (!module.IsServices) {
+    throw httpError(
+      403,
+      `Module ${moduleID} is a consultant (non-services) module. Subconsultant fees are ` +
+      'planning numbers held in this app and are never written to Projectworks. ' +
+      'Edit them on the supplier lines of the Consultant fees tab.'
+    );
+  }
+  return module;
 }
 
 async function resolveSelectedAuditUser(body) {
@@ -537,9 +833,31 @@ function sendUserResolveError(res, err) {
 }
 
 /**
+ * A damaged store never becomes a 200 and never becomes a fresh store that
+ * gets saved over the damage. It becomes a 500 that names the file.
+ */
+function sendStoreError(res, err, note) {
+  if (err && err.code === 'ESTORECORRUPT') {
+    console.error(String(err.message || err));
+    return res.status(500).json({
+      error:
+        `The app-side store (${STORE_PATH}) is unreadable or corrupt, so nothing was saved. ` +
+        'It is the only copy of the supplier lines and audit trail — restore it from a backup.' +
+        (note ? ` ${note}` : ''),
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: String((err && err.message) || err) });
+}
+
+/**
  * POST /api/v1/Forecasts/Set for one module-month. Returns { ok, error }.
  * `comment` lands in the forecast change history in the Projectworks UI;
  * the Open API only writes it (GET /Forecasts never returns it).
+ *
+ * SERVICES MODULES ONLY. This is the app's single write into Projectworks and
+ * it must keep exactly one caller — the /api/forecast route, which refuses
+ * anything that is not IsServices. Consultant fees never come through here.
  */
 async function pwSetForecast(moduleID, month, amount, comment) {
   try {
@@ -580,7 +898,12 @@ async function buildGrid(startMonth, endMonth) {
     pwGetAll('/api/v1/Forecasts', { StartDate: forecastStart, EndDate: `${endMonth}-28` }),
   ]);
 
+  // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
+  cacheModules(modules);
+
   const projectById = new Map(projects.map((p) => [p.ProjectID, p]));
+  const store = loadStore();
+  const inWindow = (m) => m >= startMonth && m <= endMonth; // 'YYYY-MM' sorts lexically
 
   // Fees to date: sum invoice line amounts by ModuleID, optionally filtered
   // to configured invoice status codes. Lines ride inside invoice headers.
@@ -609,11 +932,21 @@ async function buildGrid(startMonth, endMonth) {
     const p = projectById.get(m.ProjectID) || {};
     const fee = Number(m.Budget) || 0;
     const invoiced = feesToDate.get(m.ModuleID) || 0;
+    // Two kinds of number, two sources. Services modules (Gross fees) show what
+    // the customer plans to invoice, and Projectworks Forecasts is the field of
+    // record. Non-services modules (Consultant fees) show subconsultant costs,
+    // which live only in this app — reading them back from Projectworks would
+    // return whatever the retired rollup last wrote and drift from the supplier
+    // lines from the first edit onwards.
+    const isServices = !!m.IsServices;
+    const months = isServices
+      ? (forecastByModule.get(m.ModuleID) || {})
+      : moduleMonthTotals(store.supplierLines, m.ModuleID, inWindow);
     return {
       moduleID: m.ModuleID,
       stat: m.IsActive ? 'A' : 'I',
       isActive: !!m.IsActive,
-      isServices: !!m.IsServices,
+      isServices,
       parentNumber: p.ProjectNumber || '',
       stageNumber: m.ExternalReference || '',
       projectID: m.ProjectID,
@@ -628,7 +961,10 @@ async function buildGrid(startMonth, endMonth) {
       fee,
       feesToDate: invoiced,
       remaining: fee - invoiced,
-      months: forecastByModule.get(m.ModuleID) || {},
+      months,
+      // Which system owns `months`. The UI decides editability from this, not
+      // from the active tab, so the two cannot drift apart.
+      monthsSource: isServices ? 'projectworks' : 'store',
     };
   });
 
@@ -637,10 +973,9 @@ async function buildGrid(startMonth, endMonth) {
     String(a.stageName).localeCompare(String(b.stageName))
   );
 
-  const store = loadStore();
-
   return {
     rows,
+    netRows: buildNetRows(rows, inWindow),
     supplierLines: store.supplierLines,
     meta: {
       projects: projects.length,
@@ -695,6 +1030,7 @@ app.get('/api/grid', async (req, res) => {
   try {
     res.json(await buildGrid(start, end));
   } catch (err) {
+    if (err && err.code === 'ESTORECORRUPT') return sendStoreError(res, err);
     console.error(err);
     res.status(502).json({ error: String(err.message || err) });
   }
@@ -718,6 +1054,9 @@ app.post('/api/forecast', async (req, res) => {
   let auditUser;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
+    // The only route that writes to Projectworks, so this is the only place the
+    // consultant/services boundary has to hold. It fails closed.
+    await assertServicesModule(moduleID);
   } catch (err) {
     return sendUserResolveError(res, err);
   }
@@ -728,22 +1067,31 @@ app.post('/api/forecast', async (req, res) => {
     moduleID, month, amount,
     `Set by ${auditUser.name} via PW Billing Forecast tool`
   );
-  const store = loadStore();
-  addAudit(store, {
-    user: auditUser.name,
-    projectworksUserID: auditUser.id,
-    action: 'forecast.set',
-    project: ctx.project || '',
-    stage: ctx.stage || '',
-    supplier: '',
-    moduleID,
-    month,
-    from: ctx.from ?? '',
-    to: Number(amount),
-    synced: result.ok,
-    ...(result.ok ? {} : { error: result.error }),
-  });
-  saveStore(store);
+  try {
+    await withStoreLock(() => {
+      const store = loadStore();
+      addAudit(store, {
+        user: auditUser.name,
+        projectworksUserID: auditUser.id,
+        action: 'forecast.set',
+        target: 'projectworks',
+        project: ctx.project || '',
+        stage: ctx.stage || '',
+        supplier: '',
+        moduleID,
+        month,
+        from: ctx.from ?? '',
+        to: Number(amount),
+        synced: result.ok,
+        ...(result.ok ? {} : { error: result.error }),
+      });
+      saveStore(store);
+    });
+  } catch (err) {
+    return sendStoreError(res, err, result.ok
+      ? 'The forecast WAS written to Projectworks; only the audit entry was lost.'
+      : '');
+  }
   if (!result.ok) return res.status(502).json({ error: result.error });
   res.json({ ok: true });
 });
@@ -751,7 +1099,12 @@ app.post('/api/forecast', async (req, res) => {
 // ---- supplier lines --------------------------------------------------------
 
 app.get('/api/supplier-lines', (req, res) => {
-  const store = loadStore();
+  let store;
+  try {
+    store = loadStore();
+  } catch (err) {
+    return sendStoreError(res, err);
+  }
   const { moduleID } = req.query;
   const lines = moduleID
     ? store.supplierLines.filter((l) => l.moduleID === Number(moduleID))
@@ -772,36 +1125,43 @@ app.post('/api/supplier-lines', async (req, res) => {
     return sendUserResolveError(res, err);
   }
   const ctx = context || {};
-  const store = loadStore();
-  const line = {
-    id: store.nextLineID++,
-    moduleID: Number(moduleID),
-    supplier: String(supplier).trim(),
-    description: description ? String(description) : '',
-    months: {},
-  };
-  store.supplierLines.push(line);
-  addAudit(store, {
-    user: auditUser.name,
-    projectworksUserID: auditUser.id,
-    action: 'supplier.add',
-    project: ctx.project || '',
-    stage: ctx.stage || '',
-    supplier: line.supplier,
-    moduleID: line.moduleID,
-    month: '',
-    from: '',
-    to: '',
-    synced: true, // app-side only; nothing to sync until a month cell is set
-  });
-  saveStore(store);
-  res.json({ ok: true, line });
+  try {
+    const line = await withStoreLock(() => {
+      const store = loadStore();
+      const created = {
+        id: store.nextLineID++,
+        moduleID: Number(moduleID),
+        supplier: String(supplier).trim(),
+        description: description ? String(description) : '',
+        months: {},
+      };
+      store.supplierLines.push(created);
+      addAudit(store, {
+        user: auditUser.name,
+        projectworksUserID: auditUser.id,
+        action: 'supplier.add',
+        target: 'app',
+        project: ctx.project || '',
+        stage: ctx.stage || '',
+        supplier: created.supplier,
+        moduleID: created.moduleID,
+        month: '',
+        from: '',
+        to: '',
+      });
+      saveStore(store);
+      return created;
+    });
+    res.json({ ok: true, line });
+  } catch (err) {
+    sendStoreError(res, err);
+  }
 });
 
 /**
- * Set one month cell on a supplier line, then roll the module's month total
- * (sum across its supplier lines) up to Projectworks. The local edit is kept
- * even if the rollup sync fails; the audit entry records synced=false.
+ * Set one month cell on a supplier line. App-side only — nothing here reaches
+ * Projectworks. `moduleTotal` is the app-side rollup shown on the module row:
+ * a planning figure, not a forecast.
  */
 app.put('/api/supplier-lines/:id/month', async (req, res) => {
   if (writesBlocked(res)) return;
@@ -817,52 +1177,36 @@ app.put('/api/supplier-lines/:id/month', async (req, res) => {
     return sendUserResolveError(res, err);
   }
   const ctx = context || {};
-  const store = loadStore();
-  const line = store.supplierLines.find((l) => l.id === id);
-  if (!line) return res.status(404).json({ error: `supplier line ${id} not found` });
+  try {
+    const out = await withStoreLock(() => {
+      const store = loadStore();
+      const line = store.supplierLines.find((l) => l.id === id);
+      if (!line) return { status: 404, body: { error: `supplier line ${id} not found` } };
 
-  const from = line.months[month] ?? '';
-  line.months[month] = Number(amount);
+      const from = line.months[month] ?? '';
+      line.months[month] = Number(amount);
+      const moduleTotal = moduleMonthTotal(store.supplierLines, line.moduleID, month);
 
-  const moduleTotal = store.supplierLines
-    .filter((l) => l.moduleID === line.moduleID)
-    .reduce((s, l) => s + (Number(l.months[month]) || 0), 0);
-
-  const result = await pwSetForecast(
-    line.moduleID, month, moduleTotal,
-    `Set by ${auditUser.name} via PW Billing Forecast tool`
-  );
-
-  addAudit(store, {
-    user: auditUser.name,
-    projectworksUserID: auditUser.id,
-    action: 'supplier.set',
-    project: ctx.project || '',
-    stage: ctx.stage || '',
-    supplier: line.supplier,
-    moduleID: line.moduleID,
-    month,
-    from,
-    to: Number(amount),
-    synced: true, // the supplier cell itself is app-side; the rollup entry carries sync state
-  });
-  addAudit(store, {
-    user: auditUser.name,
-    projectworksUserID: auditUser.id,
-    action: 'rollup.set',
-    project: ctx.project || '',
-    stage: ctx.stage || '',
-    supplier: '',
-    moduleID: line.moduleID,
-    month,
-    from: ctx.moduleFrom ?? '',
-    to: moduleTotal,
-    synced: result.ok,
-    ...(result.ok ? {} : { error: result.error }),
-  });
-  saveStore(store);
-
-  res.json({ ok: true, moduleTotal, syncedToProjectworks: result.ok, ...(result.ok ? {} : { syncError: result.error }) });
+      addAudit(store, {
+        user: auditUser.name,
+        projectworksUserID: auditUser.id,
+        action: 'supplier.set',
+        target: 'app',
+        project: ctx.project || '',
+        stage: ctx.stage || '',
+        supplier: line.supplier,
+        moduleID: line.moduleID,
+        month,
+        from,
+        to: Number(amount),
+      });
+      saveStore(store);
+      return { status: 200, body: { ok: true, moduleTotal } };
+    });
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    sendStoreError(res, err);
+  }
 });
 
 app.delete('/api/supplier-lines/:id', async (req, res) => {
@@ -876,47 +1220,47 @@ app.delete('/api/supplier-lines/:id', async (req, res) => {
     return sendUserResolveError(res, err);
   }
   const ctx = context || {};
-  const store = loadStore();
-  const idx = store.supplierLines.findIndex((l) => l.id === id);
-  if (idx === -1) return res.status(404).json({ error: `supplier line ${id} not found` });
-  const [line] = store.supplierLines.splice(idx, 1);
+  try {
+    const out = await withStoreLock(() => {
+      const store = loadStore();
+      const idx = store.supplierLines.findIndex((l) => l.id === id);
+      if (idx === -1) return { status: 404, body: { error: `supplier line ${id} not found` } };
+      const [line] = store.supplierLines.splice(idx, 1);
 
-  // Re-sync every month the removed line touched so Projectworks totals drop.
-  let allSynced = true;
-  let lastError;
-  for (const month of Object.keys(line.months)) {
-    const moduleTotal = store.supplierLines
-      .filter((l) => l.moduleID === line.moduleID)
-      .reduce((s, l) => s + (Number(l.months[month]) || 0), 0);
-    const result = await pwSetForecast(
-      line.moduleID, month, moduleTotal,
-      `Set by ${auditUser.name} via PW Billing Forecast tool`
-    );
-    if (!result.ok) { allSynced = false; lastError = result.error; }
+      // App-side only. The module rows on the Consultant fees tab recompute
+      // from what is left in the store on the next read, so there is nothing
+      // to re-sync anywhere.
+      addAudit(store, {
+        user: auditUser.name,
+        projectworksUserID: auditUser.id,
+        action: 'supplier.delete',
+        target: 'app',
+        project: ctx.project || '',
+        stage: ctx.stage || '',
+        supplier: line.supplier,
+        moduleID: line.moduleID,
+        month: '',
+        from: '',
+        to: '',
+      });
+      saveStore(store);
+      return { status: 200, body: { ok: true } };
+    });
+    res.status(out.status).json(out.body);
+  } catch (err) {
+    sendStoreError(res, err);
   }
-
-  addAudit(store, {
-    user: auditUser.name,
-    projectworksUserID: auditUser.id,
-    action: 'supplier.delete',
-    project: ctx.project || '',
-    stage: ctx.stage || '',
-    supplier: line.supplier,
-    moduleID: line.moduleID,
-    month: '',
-    from: '',
-    to: '',
-    synced: allSynced,
-    ...(allSynced ? {} : { error: lastError }),
-  });
-  saveStore(store);
-  res.json({ ok: true });
 });
 
 // ---- audit -----------------------------------------------------------------
 
 app.get('/api/audit', (_req, res) => {
-  const store = loadStore();
+  let store;
+  try {
+    store = loadStore();
+  } catch (err) {
+    return sendStoreError(res, err);
+  }
   res.json({ audit: store.audit.slice(-100).reverse() });
 });
 
@@ -927,6 +1271,7 @@ app.get('/api/audit', (_req, res) => {
 // to serve — or write — anything.
 (async () => {
   RESOLVED_TENANT = await enforceTenantLock();
+  checkDataDir();
   initStore();
   const appBaseWarning = appBaseUrlTenantWarning(RESOLVED_TENANT.name);
 
@@ -937,6 +1282,29 @@ app.get('/api/audit', (_req, res) => {
     console.log(`  Auth mode: ${AUTH_MODE}`);
     console.log(`  Writes:    ${ALLOW_WRITES ? 'ENABLED' : 'disabled (read-only)'}`);
     console.log(`  Gate:      ${AUTH_DISABLED ? 'DISABLED' : `HTTP Basic (user "${BASIC_AUTH_USER}")`}`);
+    console.log(`  Data dir:  ${DATA_DIR}${DATA_DIR_ENV ? '' : '  (default — set DATA_DIR to a persistent volume before deploying)'}`);
+
+    if (!DATA_DIR_ENV) {
+      warnBanner([
+        'DATA_DIR is not set, so the app-side store lives inside the deploy',
+        'artifact at:',
+        '',
+        `  ${STORE_PATH}`,
+        '',
+        'Consultant fees are planning numbers held ONLY in that file — they are',
+        'never written to Projectworks, so nothing upstream can rebuild them.',
+        'On a platform with a throwaway filesystem, every redeploy and cold',
+        'start destroys them. Set DATA_DIR to a mounted, persistent volume.',
+      ]);
+    }
+
+    if (SEED_DEMO_DATA) {
+      warnBanner([
+        'SEED_DEMO_DATA=true — an absent store is filled with the demo',
+        'suppliers from seed.json, which are pinned to a demo moduleID.',
+        'Never set this on a customer deployment.',
+      ]);
+    }
 
     if (appBaseWarning) warnBanner(appBaseWarning);
 

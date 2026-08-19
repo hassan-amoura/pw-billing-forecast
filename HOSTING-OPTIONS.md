@@ -14,7 +14,7 @@ These are properties of the application, not preferences. They constrain every o
 |---|---|
 | **Node.js 18+ runtime** | Single Express process, two dependencies, no build step. Very portable. |
 | **Server-side credential storage** | Projectworks API credentials sit in server environment variables and never reach the browser. Rules out static-only hosting. |
-| **A writable, persistent disk** | Supplier lines and the audit trail live in `data/store.json`. Platforms with throwaway filesystems lose this data on every deploy and cold start. |
+| **A writable, persistent disk** | Supplier lines, consultant-fee planning numbers and the audit trail live in `data/store.json` (path set by `DATA_DIR`). None of it is written to Projectworks, so this file is the system of record and nothing upstream can rebuild it. Platforms with throwaway filesystems destroy it on every deploy and cold start. |
 | **Authentication added externally** | The tool has no login. The user dropdown labels audit entries; it does not authenticate. Anything on a public URL needs auth in front of it. |
 | **Single tenant per instance** | Credentials are per-tenant environment variables. One deployment serves one Projectworks tenant. |
 | **Outbound HTTPS to the Projectworks API** | No inbound access to the tenant required. |
@@ -301,9 +301,15 @@ internal product.
 
 ## Related note
 
-Supplier lines exist locally because Projectworks has no supplier grain in forecasts. If they
-were instead modelled as child modules inside Projectworks, `data/store.json` would not be needed
-at all, the tool would become stateless without any of Option D's work, and the rollup that
-currently overwrites existing Projectworks forecast values would no longer be necessary. Worth
+Supplier lines exist locally for two reasons: Projectworks has no supplier grain in forecasts,
+and subconsultant fees are incoming costs that do not belong on the Forecast screen at all —
+that screen represents what the customer invoices its clients. The module-level rollup that used
+to push these totals into Projectworks forecasts has been removed for exactly that reason, so
+`data/store.json` is now the system of record rather than a cache with an upstream copy. That
+raises the cost of losing it and makes the persistence question in this document a hard
+requirement rather than a convenience.
+
+If subconsultant costs were instead modelled inside Projectworks — as a cost/expense grain rather
+than as forecast rows — the tool could become stateless without any of Option D's work. Worth
 investigating before committing to Option D, since it reaches the same end state through the
 product rather than through infrastructure.

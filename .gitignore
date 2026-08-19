@@ -2,8 +2,12 @@
 .env
 .env.local
 
-# Runtime store (supplier lines + audit). Rebuilt from the committed seed.json
-# on boot, so it is deliberately not tracked.
+# Runtime store (supplier lines + audit). This is the SYSTEM OF RECORD for
+# consultant-fee planning numbers — they are never written to Projectworks, so
+# nothing upstream can rebuild them. It is not tracked because it is real data,
+# not because it is disposable: a deployment must set DATA_DIR to a persistent
+# volume and back it up. seed.json is demo data only, gated behind
+# SEED_DEMO_DATA and off by default.
 data/
 
 node_modules/

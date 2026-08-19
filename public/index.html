@@ -141,6 +141,7 @@
   .notice{
     font-size:12.5px;padding:8px 20px;background:#FFF8E7;border-bottom:1px solid #F0E3BC;color:#6B5A1E;
   }
+  .notice.plan{background:#F1F5FF;border-bottom-color:#CBD8F5;color:#2B3F6B}
   .notice.hidden,.hidden{display:none}
   .toast{
     position:fixed;bottom:18px;right:18px;max-width:420px;z-index:50;
@@ -284,6 +285,7 @@
   }
   td.sync-ok{color:var(--lime-ink);font-weight:700}
   td.sync-fail{color:var(--red);font-weight:700;cursor:help}
+  td.sync-app{color:var(--muted);font-family:var(--mono);font-size:11px;cursor:help}
 </style>
 </head>
 <body>
@@ -330,8 +332,8 @@
   </div>
   <div class="checks">
     <label><input type="checkbox" id="f-inactive"> Show inactive stages</label>
-    <label><input type="checkbox" id="f-hidezero"> Hide $0 fee stages</label>
-    <label><input type="checkbox" id="f-noforecast" title="Stages with fee remaining but no forecast entries in the selected range."> Remaining fees &amp; no forecast</label>
+    <label id="f-hidezero-w"><input type="checkbox" id="f-hidezero"> Hide $0 fee stages</label>
+    <label id="f-noforecast-w"><input type="checkbox" id="f-noforecast" title="Stages with fee remaining but no forecast entries in the selected range."> Remaining fees &amp; no forecast</label>
   </div>
   <div class="spacer"></div>
   <button class="ghost" id="btn-export">Export CSV</button>
@@ -341,11 +343,23 @@
 <div class="tabs">
   <button class="tab active" data-tab="gross">Gross fees<span class="n" id="n-gross"></span></button>
   <button class="tab" data-tab="consultant">Consultant fees<span class="n" id="n-consultant"></span></button>
+  <button class="tab" data-tab="net">Net position<span class="n" id="n-net"></span></button>
   <button class="tab" data-tab="audit">Audit</button>
 </div>
 
 <div class="notice hidden" id="notice-readonly">
   Read-only mode: forecast edits are disabled on this server (ALLOW_WRITES=false).
+</div>
+<div class="notice plan hidden" id="notice-consultant">
+  <b>Planning numbers only.</b> Subconsultant fees are costs coming in, so they are held in this app and are
+  <b>never written to Projectworks</b> — the Projectworks Forecast screen represents what you plan to invoice
+  your clients. Month cells on this tab are the app-side total of the supplier lines beneath them; expand a
+  stage to edit them.
+</div>
+<div class="notice plan hidden" id="notice-net">
+  <b>Read-only, one row per project.</b> Net = planned invoicing (Projectworks forecast across the project's
+  services stages) − subconsultant fees (app-side supplier lines across its consultant stages). Expand a project
+  to see the two components. Edit either on the Gross fees or Consultant fees tab; the change flows through here.
 </div>
 <div class="notice hidden" id="notice-status">
   <b>Fees to Date is unfiltered.</b> INVOICE_STATUS_CODES is not set, so every invoice status is counted —
@@ -368,7 +382,7 @@
     <thead><tr>
       <th class="txt">Time</th><th class="txt">User</th><th class="txt">Action</th>
       <th class="txt">Project</th><th class="txt">Stage</th><th class="txt">Supplier</th>
-      <th class="txt">Month</th><th>From → To</th><th class="txt">Synced</th>
+      <th class="txt">Month</th><th>From → To</th><th class="txt">Written to</th>
     </tr></thead>
     <tbody id="audit-body"></tbody>
   </table>
@@ -427,6 +441,8 @@
     rows: [],
     supplierLines: [],  // app-side lines from data/store.json, via the server
     expanded: new Set(), // moduleIDs with supplier sub-rows open (Consultant tab)
+    netRows: [],         // one row per project, computed server-side (Net position tab)
+    netExpanded: new Set(), // projectIDs with component sub-rows open (Net position tab)
     months: [],       // ['2026-07', ...]
     tab: 'gross',
     writes: false,
@@ -715,12 +731,16 @@
     clearTimeout(t._h);
     t._h = setTimeout(() => t.classList.remove('show'), err ? 5000 : 2200);
   }
-  function tickSync() {
+  function chipTick(label) {
     const c = $('chip-sync');
-    c.textContent = 'synced ' + new Date().toLocaleTimeString();
+    c.textContent = label + ' ' + new Date().toLocaleTimeString();
     c.classList.add('flash');
     setTimeout(() => c.classList.remove('flash'), 900);
   }
+  /** A write that reached Projectworks. */
+  function tickSync() { chipTick('synced'); }
+  /** An app-side write. Deliberately not called "synced" — nothing left the app. */
+  function tickSaved() { chipTick('saved'); }
 
   // ---- load ----------------------------------------------------------
   async function load() {
@@ -733,6 +753,7 @@
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || r.statusText);
       state.rows = data.rows;
+      state.netRows = data.netRows || [];
       state.supplierLines = data.supplierLines || [];
       state.months = monthsBetween(start, end);
       state.loaded = true;
@@ -789,6 +810,121 @@
   // ---- columns + render ------------------------------------------------
   const numberFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
 
+  // ---- Net position tab ------------------------------------------------
+  // One row per project: what we plan to invoice, minus what we plan to pay
+  // subconsultants. Every number arrives precomputed from /api/grid; nothing
+  // here is editable and nothing on this tab writes anywhere.
+  //
+  // Net per month with the two components on expand, rather than three columns
+  // per month: at a 12-month range that layout would be 36 money columns wide,
+  // and the components are a drill-down question ("why is this month low?")
+  // rather than a scanning one. The expander reuses the supplier sub-row idiom
+  // from the Consultant fees tab.
+  const NET_COMPONENTS = [
+    {
+      label: 'Planned invoicing',
+      months: 'plannedMonths',
+      total: 'plannedTotal',
+      hint: "Projectworks forecast summed across this project's services stages",
+    },
+    {
+      label: 'Subconsultant fees',
+      months: 'consultantMonths',
+      total: 'consultantTotal',
+      hint: "App-side supplier lines summed across this project's consultant stages — never read from Projectworks",
+    },
+  ];
+
+  function netColumns() {
+    return [
+      { key: 'parentNumber', label: 'Parent #', text: true, align: 'left', sticky: 'stick s1' },
+      { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2', sortable: 'text', sortValue: r => r.projectName },
+      { key: 'projectManagerName', label: 'Project manager', text: true, align: 'left', sortable: 'text', sortValue: r => r.projectManagerName },
+      { key: 'netTotal', label: 'Net total', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.netTotal },
+      ...state.months.map(k => ({ key: `month:${k}`, label: monthLabel(k), type: 'money', align: 'right', month: k })),
+    ];
+  }
+
+  /**
+   * Project-grain filtering. Search, PM and type carry over unchanged; "Show
+   * inactive" treats a project as active when any of its stages is. The two
+   * stage-level checkboxes (fee-based) have no project equivalent and are
+   * hidden on this tab rather than left to look applied.
+   */
+  function visibleNetRows() {
+    const q = $('f-q').value.trim().toLowerCase();
+    const pm = $('f-pm').value;
+    const ptype = $('f-type').value;
+    const showInactive = $('f-inactive').checked;
+    return state.netRows.filter(r =>
+      (showInactive || r.isActive) &&
+      (!pm || r.projectManagerName === pm) &&
+      (!ptype || r.projectType === ptype) &&
+      (!q || (r.projectName + ' ' + r.parentNumber).toLowerCase().includes(q))
+    );
+  }
+
+  function renderNetCell(col, r, open) {
+    if (col.key === 'parentNumber') return `<td ${cellAttrs(col)}>${esc(r.parentNumber)}</td>`;
+    if (col.key === 'projectName') {
+      const toggle = `<button class="tw" data-pid="${r.projectID}" title="Show planned invoicing and subconsultant fees">${open ? '▾' : '▸'}</button>`;
+      return `<td ${cellAttrs(col)}>${toggle}${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
+    }
+    if (col.key === 'projectManagerName') return `<td ${cellAttrs(col)}>${esc(r.projectManagerName)}</td>`;
+    if (col.key === 'netTotal') return `<td ${cellAttrs(col, toneClasses(r.netTotal))}>${esc(displayValue(r.netTotal, col))}</td>`;
+    if (col.month) {
+      const v = r.months[col.month];
+      const p = r.plannedMonths[col.month] || 0;
+      const c = r.consultantMonths[col.month] || 0;
+      return `<td ${cellAttrs(col, toneClasses(v), `title="${money(p)} planned invoicing − ${money(c)} subconsultant fees"`)}>${esc(displayValue(v, col))}</td>`;
+    }
+    return `<td ${cellAttrs(col)}></td>`;
+  }
+
+  function renderNetSubCell(col, r, comp) {
+    if (col.key === 'projectName') {
+      return `<td ${cellAttrs(col)}>↳ <span class="supname" title="${esc(comp.hint)}">${esc(comp.label)}</span></td>`;
+    }
+    if (col.key === 'netTotal') {
+      const v = r[comp.total];
+      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col))}</td>`;
+    }
+    if (col.month) {
+      const v = r[comp.months][col.month];
+      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col))}</td>`;
+    }
+    return `<td ${cellAttrs(col)}></td>`;
+  }
+
+  /**
+   * The two fee-based checkboxes are stage concepts with no project-grain
+   * equivalent, so the Net position tab hides them rather than leaving them
+   * looking applied. Search, PM, type and "Show inactive" all still work.
+   */
+  function syncFilterVisibility() {
+    const isNet = state.tab === 'net';
+    $('f-hidezero-w').classList.toggle('hidden', isNet);
+    $('f-noforecast-w').classList.toggle('hidden', isNet);
+  }
+
+  /** Project row followed by its two component rows, for CSV. */
+  function netExportRows(rows) {
+    const out = [];
+    for (const r of rows) {
+      out.push(r);
+      for (const comp of NET_COMPONENTS) {
+        out.push({
+          parentNumber: r.parentNumber,
+          projectName: `${r.projectName} — ${comp.label}`,
+          projectManagerName: r.projectManagerName,
+          netTotal: r[comp.total],
+          months: r[comp.months],
+        });
+      }
+    }
+    return out;
+  }
+
   function baseColumns() {
     const feeLabel = state.tab === 'consultant' ? 'Total Budget' : 'Fee';
     return [
@@ -805,7 +941,7 @@
   }
 
   function currentColumns() {
-    const defs = baseColumns();
+    const defs = state.tab === 'net' ? netColumns() : baseColumns();
     const byKey = new Map(defs.map(c => [c.key, c]));
     const seen = new Set();
     const ordered = [];
@@ -1031,9 +1167,17 @@
     if (col.key === 'feesToDate') return `<td ${cellAttrs(col, toneClasses(r.feesToDate))}>${esc(displayValue(r.feesToDate, col))}</td>`;
     if (col.key === 'remaining') return `<td ${cellAttrs(col, toneClasses(r.remaining))}>${esc(displayValue(r.remaining, col))}</td>`;
     if (col.month) {
+      // A store-sourced row is derived, never typed into: its value is the sum
+      // of the supplier lines beneath it. That holds whether or not any lines
+      // exist yet — a consultant module with none is still not a cell that may
+      // reach Projectworks.
       if (rowState.rolled) {
         const v = r.months[col.month];
-        return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="Rolled up from ${rowState.lines.length} supplier line${rowState.lines.length === 1 ? '' : 's'}"`)}>${esc(displayValue(v, col))}</td>`;
+        const n = rowState.lines.length;
+        const title = n
+          ? `App-side total of ${n} supplier line${n === 1 ? '' : 's'} — not sent to Projectworks`
+          : 'No supplier lines yet — expand this stage and add one to plan an amount';
+        return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="${title}"`)}>${esc(displayValue(v, col))}</td>`;
       }
       const v = r.months[col.month];
       return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-row="${i}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
@@ -1063,7 +1207,8 @@
     const tot = (fn) => rows.reduce((s, r) => s + fn(r), 0);
     let value = '';
     let label = '';
-    if (col.key === 'projectName') label = `Total · ${rows.length} stages`;
+    if (col.key === 'projectName') label = `Total · ${rows.length} ${state.tab === 'net' ? 'projects' : 'stages'}`;
+    if (col.key === 'netTotal') value = tot(r => r.netTotal);
     if (col.key === 'fee') value = tot(r => r.fee);
     if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
     if (col.key === 'remaining') value = tot(r => r.remaining);
@@ -1074,8 +1219,9 @@
 
   function render() {
     if (!state.loaded || state.tab === 'audit') return;
+    const isNet = state.tab === 'net';
     const cols = currentColumns();
-    const filteredRows = visibleRows();
+    const filteredRows = isNet ? visibleNetRows() : visibleRows();
     const rows = sortedRows(filteredRows, cols);
     state.viewRows = rows;
 
@@ -1085,11 +1231,38 @@
       (!$('f-hidezero').checked || r.fee !== 0));
     $('n-gross').textContent = base.filter(r => r.isServices).length;
     $('n-consultant').textContent = base.filter(r => !r.isServices).length;
+    $('n-net').textContent = state.netRows.filter(r => $('f-inactive').checked || r.isActive).length;
+    $('notice-consultant').classList.toggle('hidden', state.tab !== 'consultant');
+    $('notice-net').classList.toggle('hidden', !isNet);
 
     $('head').innerHTML = cols.map(headerHtml).join('');
     wireHeaders();
 
     const body = $('body');
+
+    if (isNet) {
+      body.innerHTML = rows.map(r => {
+        const open = state.netExpanded.has(r.projectID);
+        let html = '<tr>' + cols.map(col => renderNetCell(col, r, open)).join('') + '</tr>';
+        if (open) {
+          html += NET_COMPONENTS.map(comp =>
+            '<tr class="subrow">' + cols.map(col => renderNetSubCell(col, r, comp)).join('') + '</tr>').join('');
+        }
+        return html;
+      }).join('');
+      body.querySelectorAll('button.tw').forEach(b =>
+        b.addEventListener('click', () => {
+          const pid = Number(b.dataset.pid);
+          state.netExpanded.has(pid) ? state.netExpanded.delete(pid) : state.netExpanded.add(pid);
+          render();
+        }));
+      $('foot').innerHTML = cols.map(col => renderFooterCell(col, filteredRows)).join('');
+      $('grid').classList.remove('hidden');
+      $('empty').classList.add('hidden');
+      $('s-rows').textContent = filteredRows.length + ' projects';
+      return;
+    }
+
     const isConsultant = state.tab === 'consultant';
     body.innerHTML = rows.map((r, i) => {
       const lines = isConsultant ? linesFor(r.moduleID) : [];
@@ -1097,7 +1270,9 @@
       const rowState = {
         lines,
         open,
-        rolled: lines.length > 0,
+        // Derived from where the months came from, not from the active tab or
+        // the line count, so the read-only rule cannot drift from the server.
+        rolled: r.monthsSource === 'store',
         toggle: isConsultant
           ? `<button class="tw" data-mid="${r.moduleID}" title="Supplier lines">${open ? '▾' : '▸'}</button>`
           : '',
@@ -1199,20 +1374,16 @@
             stage: row.stageName,
             project: row.projectName,
             from: prev.trim() === '' ? '' : Number(prev.replace(/,/g, '')),
-            moduleFrom: row.months[month] ?? '',
           },
         }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || r.statusText);
       line.months[month] = amount;
+      // The module row is the app-side rollup the server just recomputed.
       row.months[month] = data.moduleTotal;
       td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
-      if (data.syncedToProjectworks === false) {
-        toast('Saved locally, but the Projectworks rollup failed: ' + (data.syncError || ''), true);
-      } else {
-        tickSync();
-      }
+      tickSaved();
       const rolledCell = $('body').querySelector(`td.rolled[data-mid="${row.moduleID}"][data-month="${month}"]`);
       if (rolledCell) {
         const monthCol = state.cols.find(c => c.month === month) || { key: `month:${month}`, type: 'money', align: 'right' };
@@ -1225,7 +1396,7 @@
     } catch (e) {
       inp.value = prev;
       td.classList.remove('failed'); void td.offsetWidth; td.classList.add('failed');
-      toast('Sync failed: ' + e.message, true);
+      toast('Save failed: ' + e.message, true);
     }
   }
 
@@ -1251,13 +1422,32 @@
       state.supplierLines.push(data.line);
       render();
       toast(`Supplier "${data.line.supplier}" added.`);
-      tickSync();
+      tickSaved();
     } catch (e) {
       toast('Add supplier failed: ' + e.message, true);
     }
   }
 
   // ---- audit tab -------------------------------------------------------
+
+  /**
+   * Where the entry actually landed. An app-side edit must not show the same
+   * tick as a write that reached Projectworks — they are different guarantees.
+   * Entries written before the two were separated carry no `target`, so it is
+   * inferred from the action: forecast.set and the retired rollup.set went to
+   * Projectworks, every supplier.* action was always app-side.
+   */
+  function writtenToCell(a) {
+    const target = a.target ||
+      (a.action === 'forecast.set' || a.action === 'rollup.set' ? 'projectworks' : 'app');
+    if (target === 'app') {
+      return '<td class="txt sync-app" title="Planning number held in this app — never sent to Projectworks">app-side</td>';
+    }
+    return a.synced
+      ? '<td class="txt sync-ok" title="Written to Projectworks">Projectworks ✓</td>'
+      : `<td class="txt sync-fail" title="${esc(a.error || 'the Projectworks write failed')}">Projectworks ✗</td>`;
+  }
+
   async function loadAudit() {
     try {
       const r = await fetch('/api/audit');
@@ -1275,9 +1465,7 @@
         `<td class="txt">${esc(a.supplier || '')}</td>` +
         `<td class="txt">${esc(a.month || '')}</td>` +
         `<td class="num">${amt(a.from)} → ${amt(a.to)}</td>` +
-        (a.synced
-          ? '<td class="txt sync-ok">✓</td>'
-          : `<td class="txt sync-fail" title="${esc(a.error || 'sync failed')}">✗</td>`) +
+        writtenToCell(a) +
         '</tr>').join('');
       $('s-rows').textContent = entries.length + ' audit entries';
     } catch (e) {
@@ -1293,6 +1481,7 @@
       const col = state.cols.find(c => c.key === cell.dataset.col);
       if (!col) return;
       let value = null;
+      if (col.key === 'netTotal') value = tot(r => r.netTotal);
       if (col.key === 'fee') value = tot(r => r.fee);
       if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
       if (col.key === 'remaining') value = tot(r => r.remaining);
@@ -1312,8 +1501,13 @@
   // ---- export --------------------------------------------------------
   function exportCsv() {
     if (!state.loaded) { toast('Load data first.', true); return; }
+    const isNet = state.tab === 'net';
     const cols = currentColumns();
-    const rows = sortedRows(visibleRows(), cols);
+    const rows = sortedRows(isNet ? visibleNetRows() : visibleRows(), cols);
+    // On the Net position tab every project exports its two components as well,
+    // whether or not it is expanded on screen — same numbers, same labels, and
+    // an export that stands on its own.
+    const exportRows = isNet ? netExportRows(rows) : rows;
     const heads = cols.map(columnLabel);
     const csvCell = (v) => {
       const s = String(v ?? '');
@@ -1323,7 +1517,7 @@
       if (col.month) return r.months[col.month] ?? '';
       return r[col.key] ?? '';
     };
-    const lines = [heads.map(csvCell).join(',')].concat(rows.map(r =>
+    const lines = [heads.map(csvCell).join(',')].concat(exportRows.map(r =>
       cols.map(col => valueFor(col, r)).map(csvCell).join(',')));
     const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
     const a = document.createElement('a');
@@ -1354,6 +1548,11 @@
       const audit = state.tab === 'audit';
       $('auditwrap').classList.toggle('hidden', !audit);
       $('gridwrap').classList.toggle('hidden', audit);
+      // Set here as well as in render(), which early-returns on the audit tab
+      // and before the first load.
+      $('notice-consultant').classList.toggle('hidden', state.tab !== 'consultant');
+      $('notice-net').classList.toggle('hidden', state.tab !== 'net');
+      syncFilterVisibility();
       if (audit) loadAudit(); else render();
     }));
 })();
