@@ -1,10 +1,11 @@
 /**
  * pw-billing-forecast — server
  *
- * A thin server with two jobs:
+ * A thin server with three jobs:
  *   1. Serve the static grid UI (public/index.html)
  *   2. Hold the Projectworks Open API credentials and proxy a small,
  *      fixed set of calls. The browser never sees the credentials.
+ *   3. Read and write the app-side consultant plan and audit trail in Postgres.
  *
  * Endpoints:
  *   GET  /api/health              — config sanity check for the UI
@@ -17,7 +18,7 @@
  *                                   → POST /api/v1/Forecasts/Set. SERVICES
  *                                   MODULES ONLY: a non-services (consultant)
  *                                   module is rejected, see below.
- *   GET  /api/supplier-lines      — app-side supplier lines (data/store.json)
+ *   GET  /api/supplier-lines      — app-side supplier lines (Postgres)
  *   POST /api/supplier-lines      — { moduleID, supplier, selectedProjectworksUserID, context }
  *   PUT  /api/supplier-lines/:id/month — { month, amount, selectedProjectworksUserID, context }
  *                                   sets the line's month cell, app-side only
@@ -31,7 +32,7 @@
  *     and writes it through POST /api/v1/Forecasts/Set.
  *
  *   Consultant fees (non-services)     — subconsultant fees the customer expects
- *     to be CHARGED. Planning numbers only. They live in data/store.json and
+ *     to be CHARGED. Planning numbers only. They live in Postgres and
  *     are NEVER written to Projectworks: the Forecast screen represents money
  *     coming in, and an incoming cost posted there misstates it. There is
  *     exactly one caller of pwSetForecast(), the /api/forecast route, and it
@@ -44,14 +45,17 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
+const { createStorage, readStorageConfig } = require('./storage');
 
 const BASE_URL = (process.env.PW_BASE_URL || '').replace(/\/+$/, '');
 const APP_BASE_URL = (process.env.PW_APP_BASE_URL || '').replace(/\/+$/, '');
 const AUTH_MODE = (process.env.AUTH_MODE || '').toLowerCase();
 const TENANT_LOCK = (process.env.PW_TENANT_LOCK || '').trim();
 const ALLOW_WRITES = process.env.ALLOW_WRITES === 'true';
+const STORAGE_CONFIG = readStorageConfig();
+const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
+const SEED_PATH = path.join(__dirname, 'seed.json');
 const STATUS_CODES = (process.env.INVOICE_STATUS_CODES || '')
   .split(',')
   .map((s) => s.trim())
@@ -92,7 +96,10 @@ if (!['basic', 'header'].includes(AUTH_MODE)) {
   if (!process.env.PW_AUTH_HEADER_NAME) missingConfig.push('PW_AUTH_HEADER_NAME is not set (required when AUTH_MODE=header).');
   if (!process.env.PW_AUTH_HEADER_VALUE) missingConfig.push('PW_AUTH_HEADER_VALUE is not set (required when AUTH_MODE=header).');
 }
+missingConfig.push(...STORAGE_CONFIG.errors);
 if (missingConfig.length) refuseToStart(missingConfig);
+
+const storage = createStorage(STORAGE_CONFIG);
 
 function authHeaders() {
   if (AUTH_MODE === 'basic') {
@@ -164,196 +171,14 @@ function requireBasicAuth(req, res, next) {
 
 // ---- app-side store (supplier lines + audit) ------------------------------
 // Projectworks has no supplier grain in forecasts, and subconsultant fees are
-// incoming costs that do not belong on the Forecast screen at all, so supplier
-// lines and their module totals live here and are NEVER written to
-// Projectworks. This file is the system of record for that data: nothing
-// upstream can rebuild it.
-//
-// DATA_DIR must therefore point at storage that survives a redeploy. It
-// defaults to ./data for local development; a hosted deployment must set it to
-// a mounted volume, or the only copy of the data is destroyed on every deploy.
-const DATA_DIR_ENV = (process.env.DATA_DIR || '').trim();
-const DATA_DIR = DATA_DIR_ENV ? path.resolve(DATA_DIR_ENV) : path.join(__dirname, 'data');
-const STORE_PATH = path.join(DATA_DIR, 'store.json');
-const SEED_PATH = path.join(__dirname, 'seed.json');
-
-// seed.json holds demo suppliers pinned to a demo moduleID. Seeding is opt-in
-// and off by default so that demo data can never appear in a customer
-// deployment; without it a brand new store starts empty.
-const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
-
-/** Thrown when store.json exists but cannot be read or parsed. Never swallowed. */
-class StoreCorruptError extends Error {
-  constructor(cause) {
-    super(`${STORE_PATH} exists but could not be read as JSON: ${cause}`);
-    this.name = 'StoreCorruptError';
-    this.code = 'ESTORECORRUPT';
-  }
-}
-
-/**
- * Shape a parsed store. Only the id counter is repaired; the arrays are NOT
- * coerced — a supplierLines that is not an array means the file is damaged,
- * and silently substituting [] would destroy it on the next save.
- */
-function normalizeStore(raw) {
-  if (!raw || typeof raw !== 'object') throw new StoreCorruptError('top level is not an object');
-  if (!Array.isArray(raw.supplierLines)) throw new StoreCorruptError('supplierLines is not an array');
-  if (!Array.isArray(raw.audit)) throw new StoreCorruptError('audit is not an array');
-  const maxID = raw.supplierLines.reduce((m, l) => Math.max(m, Number(l?.id) || 0), 0);
-  const declared = Number(raw.nextLineID) || 0;
-  return {
-    ...(raw.initialisedAt ? { initialisedAt: raw.initialisedAt } : {}),
-    nextLineID: Math.max(declared, maxID + 1),
-    supplierLines: raw.supplierLines,
-    audit: raw.audit,
-  };
-}
-
-/**
- * The store as it is on disk. Returns null only when the file is ABSENT.
- * Anything else — unreadable, truncated, malformed — throws, so no caller can
- * mistake damage for emptiness and overwrite it.
- */
-function readStoreFile() {
-  let text;
-  try {
-    text = fs.readFileSync(STORE_PATH, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return null;
-    throw new StoreCorruptError(err.message);
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new StoreCorruptError(err.message);
-  }
-  return normalizeStore(parsed);
-}
-
-/** A fresh store from seed.json. Supplier lines are seeded; the audit never is. */
-function seededStore() {
-  try {
-    const seed = normalizeStore(JSON.parse(fs.readFileSync(SEED_PATH, 'utf8')));
-    return { nextLineID: seed.nextLineID, supplierLines: seed.supplierLines, audit: [] };
-  } catch (err) {
-    console.warn(`seed.json could not be read (${err.message}); starting from an empty store.`);
-    return { nextLineID: 1, supplierLines: [], audit: [] };
-  }
-}
-
-function emptyStore() {
-  return { nextLineID: 1, supplierLines: [], audit: [] };
-}
-
-/** Throws StoreCorruptError rather than returning a fresh store over damage. */
-function loadStore() {
-  return readStoreFile() || emptyStore();
-}
-
-let tmpWriteSeq = 0;
-
-/**
- * Atomic save: write a sibling temp file, fsync it, rename it over the target.
- * rename(2) is atomic on POSIX, so a crash mid-write leaves the previous store
- * intact instead of a truncated one. Never writes onto STORE_PATH directly.
- */
-function saveStore(store) {
-  if (!store.initialisedAt) store.initialisedAt = new Date().toISOString();
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = path.join(DATA_DIR, `.store.json.${process.pid}.${tmpWriteSeq++}.tmp`);
-  let fd;
-  try {
-    fd = fs.openSync(tmp, 'w');
-    fs.writeFileSync(fd, JSON.stringify(store, null, 2));
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    fs.renameSync(tmp, STORE_PATH);
-  } catch (err) {
-    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
-    try { fs.unlinkSync(tmp); } catch {}
-    throw err;
-  }
-}
-
-/**
- * Serialises every load -> mutate -> save so two overlapping requests cannot
- * interleave and lose one another's edit, audit entry or line id. Reads are
- * not queued: the atomic save means a reader sees either the whole old file or
- * the whole new one.
- */
-let storeQueue = Promise.resolve();
-function withStoreLock(fn) {
-  const result = storeQueue.then(() => fn());
-  storeQueue = result.then(() => undefined, () => undefined);
-  return result;
-}
-
-/**
- * Boot-time store initialisation. A store file that exists is ALWAYS kept as
- * it is — an empty supplierLines array is a legitimate state (the user deleted
- * their last line) and must never trigger a reseed. A file that cannot be read
- * stops the server rather than being overwritten. Only an absent file creates
- * anything, and it seeds demo data only when SEED_DEMO_DATA=true.
- */
-function initStore() {
-  let existing;
-  try {
-    existing = readStoreFile();
-  } catch (err) {
-    refuseToStart([
-      'The app-side store could not be read, and it is the ONLY copy of the',
-      'supplier lines and audit trail — nothing upstream can rebuild it.',
-      '',
-      `  ${String(err.message || err)}`,
-      '',
-      'Refusing to start rather than overwriting it. Move the damaged file',
-      'aside and restore it from a backup, then start again.',
-    ]);
-  }
-  if (existing) {
-    console.log(`  Store:     ${STORE_PATH} kept (${existing.supplierLines.length} supplier lines, ${existing.audit.length} audit entries)`);
-    return;
-  }
-  const fresh = SEED_DEMO_DATA ? seededStore() : emptyStore();
-  saveStore(fresh);
-  console.log(
-    SEED_DEMO_DATA
-      ? `  Store:     no store file — SEEDED WITH DEMO DATA from seed.json (${fresh.supplierLines.length} supplier lines)`
-      : `  Store:     no store file — created empty at ${STORE_PATH}`
-  );
-}
-
-/** DATA_DIR must be writable before anything tries to save into it. */
-function checkDataDir() {
-  if (!DATA_DIR_ENV) return;
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.accessSync(DATA_DIR, fs.constants.W_OK);
-  } catch (err) {
-    refuseToStart([
-      `DATA_DIR is set to "${DATA_DIR_ENV}" but is not writable:`,
-      '',
-      `  ${String(err.message || err)}`,
-      '',
-      'This directory holds data/store.json, the system of record for supplier',
-      'lines and the audit trail. Point DATA_DIR at a mounted, writable volume',
-      'that survives a redeploy.',
-    ]);
-  }
-}
-
-function addAudit(store, entry) {
-  store.audit.push({ time: new Date().toISOString(), ...entry });
-  if (store.audit.length > 5000) store.audit = store.audit.slice(-5000);
-}
+// incoming costs that do not belong on the Forecast screen. Postgres is the
+// only runtime store for supplier lines and audit entries; data/store.json is
+// retained solely as the source for the one-time migration.
 
 /**
  * The app-side rollup: the total planned across every supplier line on a
- * module for one month. This is the single definition — the grid read, the
- * cell edit and the line delete all call it, so they cannot drift apart.
+ * module for one month. This is the read-side definition used to compose the
+ * grid from the supplier-line rows returned by Postgres.
  * It is a planning figure and is never sent to Projectworks.
  */
 function moduleMonthTotal(supplierLines, moduleID, month) {
@@ -832,22 +657,11 @@ function sendUserResolveError(res, err) {
   res.status(err.status || 502).json({ error: String(err.message || err) });
 }
 
-/**
- * A damaged store never becomes a 200 and never becomes a fresh store that
- * gets saved over the damage. It becomes a 500 that names the file.
- */
 function sendStoreError(res, err, note) {
-  if (err && err.code === 'ESTORECORRUPT') {
-    console.error(String(err.message || err));
-    return res.status(500).json({
-      error:
-        `The app-side store (${STORE_PATH}) is unreadable or corrupt, so nothing was saved. ` +
-        'It is the only copy of the supplier lines and audit trail — restore it from a backup.' +
-        (note ? ` ${note}` : ''),
-    });
-  }
   console.error(err);
-  return res.status(500).json({ error: String((err && err.message) || err) });
+  return res.status(500).json({
+    error: String((err && err.message) || err) + (note ? ` ${note}` : ''),
+  });
 }
 
 /**
@@ -886,23 +700,24 @@ function monthKey(dateStr) {
 
 /** Build the composed grid: one row per module (stage). */
 async function buildGrid(startMonth, endMonth) {
-  // Fetch the four collections in parallel. Forecasts are date-bounded to
-  // the requested window; the rest are full pulls (fees to date is all-time).
+  // Forecasts are date-bounded to the requested window; the other Projectworks
+  // collections are full pulls (fees to date is all-time). Supplier lines are
+  // read from Postgres in parallel and never from Projectworks.
   // The live API returns PascalCase fields (ModuleID, Budget, IsServices, …)
   // — verified against the sandbox tenant, not the swagger's casing.
   const forecastStart = `${startMonth}-01`;
-  const [projects, modules, invoices, forecasts] = await Promise.all([
+  const [projects, modules, invoices, forecasts, supplierLines] = await Promise.all([
     pwGetAll('/api/v1/Projects'),
     pwGetAll('/api/v1/Modules'),
     pwGetAll('/api/v1/Invoices'),
     pwGetAll('/api/v1/Forecasts', { StartDate: forecastStart, EndDate: `${endMonth}-28` }),
+    storage.getSupplierLines(),
   ]);
 
   // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
   cacheModules(modules);
 
   const projectById = new Map(projects.map((p) => [p.ProjectID, p]));
-  const store = loadStore();
   const inWindow = (m) => m >= startMonth && m <= endMonth; // 'YYYY-MM' sorts lexically
 
   // Fees to date: sum invoice line amounts by ModuleID, optionally filtered
@@ -941,7 +756,7 @@ async function buildGrid(startMonth, endMonth) {
     const isServices = !!m.IsServices;
     const months = isServices
       ? (forecastByModule.get(m.ModuleID) || {})
-      : moduleMonthTotals(store.supplierLines, m.ModuleID, inWindow);
+      : moduleMonthTotals(supplierLines, m.ModuleID, inWindow);
     return {
       moduleID: m.ModuleID,
       stat: m.IsActive ? 'A' : 'I',
@@ -976,7 +791,7 @@ async function buildGrid(startMonth, endMonth) {
   return {
     rows,
     netRows: buildNetRows(rows, inWindow),
-    supplierLines: store.supplierLines,
+    supplierLines,
     meta: {
       projects: projects.length,
       modules: modules.length,
@@ -1030,7 +845,6 @@ app.get('/api/grid', async (req, res) => {
   try {
     res.json(await buildGrid(start, end));
   } catch (err) {
-    if (err && err.code === 'ESTORECORRUPT') return sendStoreError(res, err);
     console.error(err);
     res.status(502).json({ error: String(err.message || err) });
   }
@@ -1068,9 +882,8 @@ app.post('/api/forecast', async (req, res) => {
     `Set by ${auditUser.name} via PW Billing Forecast tool`
   );
   try {
-    await withStoreLock(() => {
-      const store = loadStore();
-      addAudit(store, {
+    await storage.transaction(async (tx) => {
+      await tx.appendAudit({
         user: auditUser.name,
         projectworksUserID: auditUser.id,
         action: 'forecast.set',
@@ -1085,7 +898,6 @@ app.post('/api/forecast', async (req, res) => {
         synced: result.ok,
         ...(result.ok ? {} : { error: result.error }),
       });
-      saveStore(store);
     });
   } catch (err) {
     return sendStoreError(res, err, result.ok
@@ -1098,18 +910,14 @@ app.post('/api/forecast', async (req, res) => {
 
 // ---- supplier lines --------------------------------------------------------
 
-app.get('/api/supplier-lines', (req, res) => {
-  let store;
+app.get('/api/supplier-lines', async (req, res) => {
   try {
-    store = loadStore();
+    const { moduleID } = req.query;
+    const lines = await storage.getSupplierLines(moduleID ? Number(moduleID) : undefined);
+    res.json({ supplierLines: lines });
   } catch (err) {
-    return sendStoreError(res, err);
+    sendStoreError(res, err);
   }
-  const { moduleID } = req.query;
-  const lines = moduleID
-    ? store.supplierLines.filter((l) => l.moduleID === Number(moduleID))
-    : store.supplierLines;
-  res.json({ supplierLines: lines });
 });
 
 app.post('/api/supplier-lines', async (req, res) => {
@@ -1126,17 +934,13 @@ app.post('/api/supplier-lines', async (req, res) => {
   }
   const ctx = context || {};
   try {
-    const line = await withStoreLock(() => {
-      const store = loadStore();
-      const created = {
-        id: store.nextLineID++,
+    const line = await storage.transaction(async (tx) => {
+      const created = await tx.createSupplierLine({
         moduleID: Number(moduleID),
         supplier: String(supplier).trim(),
         description: description ? String(description) : '',
-        months: {},
-      };
-      store.supplierLines.push(created);
-      addAudit(store, {
+      });
+      await tx.appendAudit({
         user: auditUser.name,
         projectworksUserID: auditUser.id,
         action: 'supplier.add',
@@ -1149,7 +953,6 @@ app.post('/api/supplier-lines', async (req, res) => {
         from: '',
         to: '',
       });
-      saveStore(store);
       return created;
     });
     res.json({ ok: true, line });
@@ -1178,30 +981,24 @@ app.put('/api/supplier-lines/:id/month', async (req, res) => {
   }
   const ctx = context || {};
   try {
-    const out = await withStoreLock(() => {
-      const store = loadStore();
-      const line = store.supplierLines.find((l) => l.id === id);
-      if (!line) return { status: 404, body: { error: `supplier line ${id} not found` } };
+    const out = await storage.transaction(async (tx) => {
+      const changed = await tx.setSupplierLineMonth(id, month, Number(amount));
+      if (!changed) return { status: 404, body: { error: `supplier line ${id} not found` } };
 
-      const from = line.months[month] ?? '';
-      line.months[month] = Number(amount);
-      const moduleTotal = moduleMonthTotal(store.supplierLines, line.moduleID, month);
-
-      addAudit(store, {
+      await tx.appendAudit({
         user: auditUser.name,
         projectworksUserID: auditUser.id,
         action: 'supplier.set',
         target: 'app',
         project: ctx.project || '',
         stage: ctx.stage || '',
-        supplier: line.supplier,
-        moduleID: line.moduleID,
+        supplier: changed.line.supplier,
+        moduleID: changed.line.moduleID,
         month,
-        from,
+        from: changed.from,
         to: Number(amount),
       });
-      saveStore(store);
-      return { status: 200, body: { ok: true, moduleTotal } };
+      return { status: 200, body: { ok: true, moduleTotal: changed.moduleTotal } };
     });
     res.status(out.status).json(out.body);
   } catch (err) {
@@ -1221,16 +1018,11 @@ app.delete('/api/supplier-lines/:id', async (req, res) => {
   }
   const ctx = context || {};
   try {
-    const out = await withStoreLock(() => {
-      const store = loadStore();
-      const idx = store.supplierLines.findIndex((l) => l.id === id);
-      if (idx === -1) return { status: 404, body: { error: `supplier line ${id} not found` } };
-      const [line] = store.supplierLines.splice(idx, 1);
+    const out = await storage.transaction(async (tx) => {
+      const line = await tx.deleteSupplierLine(id);
+      if (!line) return { status: 404, body: { error: `supplier line ${id} not found` } };
 
-      // App-side only. The module rows on the Consultant fees tab recompute
-      // from what is left in the store on the next read, so there is nothing
-      // to re-sync anywhere.
-      addAudit(store, {
+      await tx.appendAudit({
         user: auditUser.name,
         projectworksUserID: auditUser.id,
         action: 'supplier.delete',
@@ -1243,7 +1035,6 @@ app.delete('/api/supplier-lines/:id', async (req, res) => {
         from: '',
         to: '',
       });
-      saveStore(store);
       return { status: 200, body: { ok: true } };
     });
     res.status(out.status).json(out.body);
@@ -1254,25 +1045,22 @@ app.delete('/api/supplier-lines/:id', async (req, res) => {
 
 // ---- audit -----------------------------------------------------------------
 
-app.get('/api/audit', (_req, res) => {
-  let store;
+app.get('/api/audit', async (_req, res) => {
   try {
-    store = loadStore();
+    res.json({ audit: await storage.getAudit(100) });
   } catch (err) {
-    return sendStoreError(res, err);
+    sendStoreError(res, err);
   }
-  res.json({ audit: store.audit.slice(-100).reverse() });
 });
 
 // ---- boot ------------------------------------------------------------------
 
-// The tenant lock is resolved from the API before the store is touched and
+// The tenant lock is resolved from the API before the database is touched and
 // before the server accepts a single request, so a wrong credential never gets
 // to serve — or write — anything.
 (async () => {
   RESOLVED_TENANT = await enforceTenantLock();
-  checkDataDir();
-  initStore();
+  const storageStatus = await storage.initialize({ seedDemoData: SEED_DEMO_DATA, seedPath: SEED_PATH });
   const appBaseWarning = appBaseUrlTenantWarning(RESOLVED_TENANT.name);
 
   app.listen(PORT, HOST, () => {
@@ -1282,26 +1070,15 @@ app.get('/api/audit', (_req, res) => {
     console.log(`  Auth mode: ${AUTH_MODE}`);
     console.log(`  Writes:    ${ALLOW_WRITES ? 'ENABLED' : 'disabled (read-only)'}`);
     console.log(`  Gate:      ${AUTH_DISABLED ? 'DISABLED' : `HTTP Basic (user "${BASIC_AUTH_USER}")`}`);
-    console.log(`  Data dir:  ${DATA_DIR}${DATA_DIR_ENV ? '' : '  (default — set DATA_DIR to a persistent volume before deploying)'}`);
-
-    if (!DATA_DIR_ENV) {
-      warnBanner([
-        'DATA_DIR is not set, so the app-side store lives inside the deploy',
-        'artifact at:',
-        '',
-        `  ${STORE_PATH}`,
-        '',
-        'Consultant fees are planning numbers held ONLY in that file — they are',
-        'never written to Projectworks, so nothing upstream can rebuild them.',
-        'On a platform with a throwaway filesystem, every redeploy and cold',
-        'start destroys them. Set DATA_DIR to a mounted, persistent volume.',
-      ]);
+    console.log(`  Database:  connected (instance "${STORAGE_CONFIG.instanceId}")`);
+    if (storageStatus.trimmedAuditEntries) {
+      console.log(`  Audit:     removed ${storageStatus.trimmedAuditEntries} entries over AUDIT_RETENTION_LIMIT`);
     }
 
     if (SEED_DEMO_DATA) {
       warnBanner([
-        'SEED_DEMO_DATA=true — an absent store is filled with the demo',
-        'suppliers from seed.json, which are pinned to a demo moduleID.',
+        'SEED_DEMO_DATA=true — a brand-new empty dataset for this INSTANCE_ID is',
+        'filled from seed.json, whose suppliers are pinned to a demo moduleID.',
         'Never set this on a customer deployment.',
       ]);
     }
@@ -1331,10 +1108,8 @@ app.get('/api/audit', (_req, res) => {
     }
   });
 })().catch((err) => {
-  // enforceTenantLock() exits on every failure it knows about; anything landing
-  // here is unexpected, and still must not start a server of unknown tenancy.
   refuseToStart([
-    'The tenant lock check failed unexpectedly and the tenant is unconfirmed:',
+    'A required startup check failed. The server did not start:',
     '',
     `  ${String(err && err.stack ? err.stack : err)}`,
   ]);

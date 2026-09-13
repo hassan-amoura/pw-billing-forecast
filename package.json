@@ -4,13 +4,16 @@
   "description": "Billing forecast grid on the Projectworks Open API. Read stages, fees, invoiced-to-date and monthly forecasts; edit forecast cells and sync back.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate:store": "node scripts/migrate-store.js",
+    "backup:export": "node scripts/export-backup.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pg": "^8.23.0"
   }
 }

@@ -10,7 +10,7 @@ The two tabs hold two different kinds of number and they do not share a home:
 |---|---|---|
 | Modules | `IsServices` true | `IsServices` false |
 | Means | What you plan to **invoice** your clients | Subconsultant fees you expect to be **charged** |
-| Field of record | Projectworks Forecasts | `data/store.json` in this app |
+| Field of record | Projectworks Forecasts | Postgres in this app |
 | Written to Projectworks | Yes, `POST /api/v1/Forecasts/Set` | **Never** |
 
 A third grid tab, **Net position**, puts the two together: one row per project,
@@ -21,7 +21,7 @@ cannot disagree with them.
 Subconsultant amounts are planning numbers only. The Projectworks Forecast
 screen represents money coming in, so a cost posted there misstates it — the
 server refuses any `Forecasts/Set` for a non-services module, and the
-Consultant fees tab reads its month values back from `store.json`, never from
+Consultant fees tab reads its month values back from Postgres, never from
 Projectworks.
 
 This is a standalone third-party utility. It is not part of the
@@ -32,12 +32,12 @@ credentials, and the data flow.
 
 ```
 Browser (grid UI)  ──►  Node/Express server  ──►  Projectworks Open API
-                        holds the credentials
+                        │ holds the credentials
+                        └──────────────────────►  Postgres app-side store
 ```
 
-The browser never sees the API credentials. The server is a thin proxy
-with exactly two jobs: serve the static page and forward a fixed set of
-API calls.
+The browser never sees the API credentials. The server serves the static page,
+forwards a fixed set of Projectworks calls, and owns the Postgres storage layer.
 
 ## Setup
 
@@ -61,8 +61,11 @@ npm start               # http://localhost:3000
 | `PW_USERNAME` / `PW_PASSWORD` | Required when `AUTH_MODE=basic`. |
 | `PW_AUTH_HEADER_NAME` / `PW_AUTH_HEADER_VALUE` | Required when `AUTH_MODE=header`. |
 | `ALLOW_WRITES` | All edits — Projectworks forecasts and app-side supplier lines alike — are blocked unless this is exactly `true`. |
-| `DATA_DIR` | Optional, default `./data`. Where `store.json` lives. **A hosted deployment must set this to a mounted, persistent volume**: it is the only copy of the consultant-fee planning data. The server refuses to start if it is set but not writable, and warns loudly on boot if it is unset. |
-| `SEED_DEMO_DATA` | Optional, default off. When exactly `true`, an **absent** store file is filled with the demo suppliers from `seed.json`. Never set it on a customer deployment. |
+| `DATABASE_URL` | Required Postgres connection string. The app has no JSON fallback and refuses to boot if the database is unreachable. |
+| `DATABASE_SSL_MODE` | Required: `disable` for a trusted local connection or `require` for hosted TLS. |
+| `INSTANCE_ID` | Required stable deployment/tenant identifier. Every app-side read and write is scoped to it. |
+| `AUDIT_RETENTION_LIMIT` | Optional positive integer. Unset means unlimited. When set, excess old entries are removed at boot; audit append never truncates. |
+| `SEED_DEMO_DATA` | Optional, default off. When exactly `true`, a brand-new, empty app-side dataset for this `INSTANCE_ID` is filled from `seed.json`. Never set it on a customer deployment. |
 | `INVOICE_STATUS_CODES` | Comma-separated invoice `statusCode` values counted in Fees to Date. Empty = all statuses, which is wrong for revenue figures — the server warns on boot and the UI shows a banner. |
 | `PW_APP_BASE_URL` | Optional tenant web app URL for deep links. Empty renders plain text. Its subdomain is checked against the resolved tenant on boot; a mismatch warns loudly, since it means the links point somewhere other than the data. |
 | `PORT` | Optional, default 3000. The server always binds `0.0.0.0`. |
@@ -76,26 +79,34 @@ The server binds `0.0.0.0` on `process.env.PORT`, so it works as-is on a
 platform that injects a port. Set every variable above as a platform secret —
 `.env` is gitignored and is not deployed.
 
-### The store is the system of record
+### Postgres is the app-side system of record
 
-`store.json` holds the supplier lines, the consultant-fee planning numbers and
-the audit trail. None of it is written to Projectworks, so **nothing upstream
-can rebuild it**. Treat it as production data:
+Postgres holds the supplier lines, consultant-fee planning numbers and audit
+trail. None of it is written to Projectworks, so **nothing upstream can rebuild
+it**. Use a managed database with provider backups and run an application-level
+backup when needed:
 
-- Set `DATA_DIR` to a mounted volume that survives redeploys and cold starts.
-  On a throwaway filesystem every deploy destroys the data.
-- Run one instance. Two instances on separate filesystems is silent
-  split-brain, not an outage anyone notices.
-- Back the volume up off-machine. A volume is not a backup.
+```bash
+npm run backup:export
+```
 
-Boot behaviour: a store file that exists is **always** kept exactly as it is —
-an empty `supplierLines` array is a legitimate state (the user deleted their
-last line) and never triggers a reseed. A file that cannot be read stops the
-server rather than being overwritten; move it aside and restore from a backup.
-Only an absent file creates anything, and it seeds demo data only when
-`SEED_DEMO_DATA=true`. Saves are atomic (temp file, fsync, rename), and
-concurrent edits are serialised, so a crash mid-write leaves the previous store
-intact rather than a truncated one.
+The command writes an exclusive, mode-0600 JSON file under `backups/` by default;
+pass a path after `--` or use `--stdout`. The server creates/validates the schema
+at boot and refuses to listen if the database cannot be reached.
+
+### One-time migration from `data/store.json`
+
+Run the rollback-only dry run first, then the real import. The target
+`INSTANCE_ID` must be empty; the import is one transaction and validates the
+supplier-line, expanded-month and audit counts before commit.
+
+```bash
+npm run migrate:store -- --dry-run data/store.json
+npm run migrate:store -- data/store.json
+```
+
+The JSON source is read-only and retained after migration. Existing supplier
+line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra`.
 
 ## Before any demo
 
@@ -150,13 +161,7 @@ intact rather than a truncated one.
 
 - Editing the Fee column (would use `PATCH /api/v1/Modules/{id}`)
 - Business unit / originator filters (need custom field mapping per tenant)
-- Any local database — see the deferred list below
 
 ## Deferred (known, deliberately not built)
 
-- SQLite (or managed DB) instead of a JSON file
-- Automated backups of the store
-- A single-instance lock file
 - Edit-conflict detection between two browsers
-- An audit retention policy (currently a hard trim at 5000 entries)
-- The net view tab
