@@ -13,7 +13,7 @@ const {
   resolveModuleCustomFields,
 } = require('../app-logic');
 
-test('tenant office lock requires the complete office set regardless of case or order', () => {
+test('tenant office lock accepts an observed subset and rejects offices outside the allow-list', () => {
   const exact = compareTenantOfficeNames(
     ['SJB MEL', 'SJB SYD'],
     ['sjb syd', '  SJB   MEL  ']
@@ -23,7 +23,9 @@ test('tenant office lock requires the complete office set regardless of case or 
 
   assert.equal(exact.matches, true);
   assert.deepEqual(exact.matchedNames, ['SJB MEL', 'sjb syd']);
+  assert.equal(incomplete.matches, true);
   assert.deepEqual(incomplete.missing, ['SJB SYD']);
+  assert.equal(extra.matches, false);
   assert.deepEqual(extra.unexpected, ['Other']);
 });
 

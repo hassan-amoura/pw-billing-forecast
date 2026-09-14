@@ -24,7 +24,7 @@ function normalizedLabel(value) {
   return String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-/** Compare configured and API-returned office names as exact normalized sets. */
+/** Confirm every API-returned office name is in the configured allow-list. */
 function compareTenantOfficeNames(expectedNames, actualNames) {
   const uniqueByNormalizedName = (values) => {
     const names = new Map();
@@ -42,7 +42,7 @@ function compareTenantOfficeNames(expectedNames, actualNames) {
   const unexpected = [...actual.keys()].filter((name) => !expected.has(name)).map((name) => actual.get(name));
 
   return {
-    matches: missing.length === 0 && unexpected.length === 0,
+    matches: actual.size > 0 && unexpected.length === 0,
     matchedNames: [...expected.keys()].map((name) => actual.get(name)).filter(Boolean),
     missing,
     unexpected,

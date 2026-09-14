@@ -11,8 +11,8 @@ the Render Blueprint from `render.yaml`.
 
 - `PW_BASE_URL`: exact endpoint issued with the SJB API account.
 - `PW_USERNAME` and `PW_PASSWORD`: SJB consumer key and secret.
-- `PW_TENANT_LOCK`: complete comma-separated set of SJB office names returned
-  on project records. For the two organisations shown, use `SJB MEL,SJB SYD`.
+- `PW_TENANT_LOCK`: comma-separated allow-list of SJB office names returned on
+  project records. For the two organisations shown, use `SJB MEL,SJB SYD`.
 - `PW_APP_BASE_URL`: exact SJB Projectworks browser URL.
 - `DATABASE_URL`: backed-up production Postgres connection string.
 - `DATABASE_SSL_MODE`: `require` when using Render's internal Postgres URL.
@@ -30,10 +30,11 @@ leaves fields blank when it cannot prove the mapping.
 
 ## 2. Read-only acceptance
 
-The server must boot with an exact tenant-lock match. Confirm its header shows
-`SJB MEL + SJB SYD`; if the API uses different `officeName` values, startup will
-print the actual names and stop. Then check all of the following before enabling
-writes:
+The server must boot with only SJB office names. Its header shows the offices
+actually present on the returned project records (for example, `SJB SYD`); an
+organisation with no returned projects is not required to appear. If the API
+uses a name outside the allow-list, startup prints it and stops. Then check all
+of the following before enabling writes:
 
 1. Reconcile one Gross stage: budget, approved invoice total, remaining, and a
    monthly forecast.

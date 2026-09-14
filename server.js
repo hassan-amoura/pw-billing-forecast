@@ -421,9 +421,10 @@ async function resolveTenantOfficeNames() {
 }
 
 /**
- * Resolve the tenant and compare its exact office-name set to PW_TENANT_LOCK.
- * Fails closed: every path that does not end in a confirmed match stops the
- * server. Returns { name, names, offices } on success.
+ * Resolve the tenant and require every office name returned on its projects to
+ * be in PW_TENANT_LOCK. The lock is an allow-list rather than a required set:
+ * an organisation with no returned projects cannot be discovered through this
+ * endpoint. Fails closed on any unexpected office name.
  */
 async function enforceTenantLock() {
   const defaultLockName = TENANT_LOCK_NAMES.find((name) => DEFAULT_OFFICE_NAMES.has(normalizeTenantName(name)));
@@ -481,11 +482,10 @@ async function enforceTenantLock() {
   const comparison = compareTenantOfficeNames(TENANT_LOCK_NAMES, offices);
   if (!comparison.matches) {
     refuseToStart([
-      'TENANT MISMATCH — the credential did not return the exact expected office set.',
+      'TENANT MISMATCH — the credential returned an office outside the SJB allow-list.',
       '',
-      `  Expected (PW_TENANT_LOCK): "${TENANT_LOCK}"`,
+      `  Allowed (PW_TENANT_LOCK):  "${TENANT_LOCK}"`,
       `  Actual (from the API):     "${offices.join('", "')}"`,
-      ...(comparison.missing.length ? [`  Missing expected office(s):  "${comparison.missing.join('", "')}"`] : []),
       ...(comparison.unexpected.length ? [`  Unexpected office(s):       "${comparison.unexpected.join('", "')}"`] : []),
       '',
       `  API host: ${new URL(BASE_URL).host} (identical for every tenant, so it`,
@@ -494,7 +494,7 @@ async function enforceTenantLock() {
       'The credential in PW_USERNAME / PW_PASSWORD or PW_AUTH_HEADER_VALUE',
       'belongs to a different tenant than the one this deployment is locked to.',
       'Either fix the credential, or — if re-pointing at this tenant is',
-      'intended — update PW_TENANT_LOCK to the complete comma-separated office list.',
+      'intended — update PW_TENANT_LOCK to the complete comma-separated allow-list.',
     ]);
   }
 
