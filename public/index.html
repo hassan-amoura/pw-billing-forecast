@@ -326,6 +326,10 @@
     <label for="f-type" title="Approximates BQE/Deltek's Class filter using Project Type — not a literal field match.">Project type</label>
     <select id="f-type"><option value="">All types</option></select>
   </div>
+  <div class="field hidden" id="f-gl-w">
+    <label for="f-gl">Consultant GL type</label>
+    <select id="f-gl"><option value="">All GL types</option></select>
+  </div>
   <div class="field">
     <label for="f-q">Search</label>
     <input type="search" id="f-q" placeholder="Project or stage">
@@ -351,7 +355,8 @@
   Read-only mode: forecast edits are disabled on this server (ALLOW_WRITES=false).
 </div>
 <div class="notice plan hidden" id="notice-consultant">
-  <b>Planning numbers only.</b> Subconsultant fees are costs coming in, so they are held in this app and are
+  <b>Consultant costs.</b> Fees to Date is approved Projectworks expense actuals before tax, through today.
+  Monthly planning numbers are held in this app and are
   <b>never written to Projectworks</b> — the Projectworks Forecast screen represents what you plan to invoice
   your clients. Month cells on this tab are the app-side total of the supplier lines beneath them; expand a
   stage to edit them.
@@ -366,9 +371,11 @@
   including drafts and unapproved invoices. Set it to the approved status code(s) for this tenant before
   trusting or demoing these revenue figures.
 </div>
+<div class="notice hidden" id="notice-expense"></div>
+<div class="notice hidden" id="notice-custom-fields"></div>
 
 <div class="gridwrap" id="gridwrap">
-  <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, invoiced-to-date and forecasts from Projectworks.</div>
+  <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks.</div>
   <table id="grid" class="hidden">
     <thead><tr id="head"></tr></thead>
     <tbody id="body"></tbody>
@@ -377,7 +384,7 @@
 </div>
 
 <div class="gridwrap hidden" id="auditwrap">
-  <div class="audit-note">Preview — full audit reporting ships in the production build</div>
+  <div class="audit-note">Latest 100 forecast and consultant-planning changes</div>
   <table>
     <thead><tr>
       <th class="txt">Time</th><th class="txt">User</th><th class="txt">Action</th>
@@ -439,7 +446,7 @@
   const $ = (id) => document.getElementById(id);
   const state = {
     rows: [],
-    supplierLines: [],  // app-side lines from data/store.json, via the server
+    supplierLines: [],  // app-side consultant planning lines from Postgres
     expanded: new Set(), // moduleIDs with supplier sub-rows open (Consultant tab)
     netRows: [],         // one row per project, computed server-side (Net position tab)
     netExpanded: new Set(), // projectIDs with component sub-rows open (Net position tab)
@@ -448,6 +455,8 @@
     writes: false,
     loaded: false,
     appBase: '',    // PW_APP_BASE_URL from /api/health; '' = render plain text, no links
+    currencyCodes: [],
+    defaultCurrency: '',
     sort: { key: null, dir: null }, // dir: 'asc', 'desc', or null
     cols: [],       // ordered column defs for the current render
     viewRows: [],   // filtered rows backing the current tbody (data-row indexes point here)
@@ -702,8 +711,22 @@
   });
 
   // ---- helpers -------------------------------------------------------
-  const fmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const money = (n) => (n === 0 || n) ? fmt.format(n) : '';
+  const moneyFormatters = new Map();
+  const money = (n, currencyCode = state.defaultCurrency) => {
+    if (!(n === 0 || n)) return '';
+    const code = String(currencyCode || '').trim().toUpperCase();
+    if (!code) return numberFmt.format(Number(n));
+    try {
+      if (!moneyFormatters.has(code)) {
+        moneyFormatters.set(code, new Intl.NumberFormat('en-US', {
+          style: 'currency', currency: code, minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }));
+      }
+      return moneyFormatters.get(code).format(Number(n));
+    } catch {
+      return `${code} ${numberFmt.format(Number(n))}`;
+    }
+  };
   // Deep link into the Projectworks web app; plain text when PW_APP_BASE_URL is unset.
   const pwLink = (path, inner, title) => state.appBase
     ? `<a class="pwl" href="${state.appBase}${path}" target="_blank" rel="noopener" title="${title}">${inner}</a>`
@@ -756,13 +779,33 @@
       state.netRows = data.netRows || [];
       state.supplierLines = data.supplierLines || [];
       state.months = monthsBetween(start, end);
+      state.currencyCodes = data.meta.currencyCodes || [];
+      state.defaultCurrency = state.currencyCodes.length === 1 ? state.currencyCodes[0] : '';
       state.loaded = true;
       $('s-meta').textContent =
         `${data.meta.projects} projects · ${data.meta.modules} stages · ` +
-        `${data.meta.invoices} invoices · ${data.meta.forecastEntries} forecast entries`;
+        `${data.meta.invoices} invoices · ${data.meta.expenseClaims} expenses · ` +
+        `${data.meta.forecastEntries} forecast entries`;
       $('notice-status').classList.toggle('hidden',
         !(typeof data.meta.invoiceStatusFilter === 'string')); // string = unfiltered warning
       buildPmFilter();
+      const expenseProblems = Number(data.meta.expenseCurrencyIssueCount || 0) +
+        Number(data.meta.expenseMissingModuleCount || 0) + Number(data.meta.expenseMissingAmountCount || 0) +
+        Number(data.meta.expenseMissingDateCount || 0);
+      $('notice-expense').classList.toggle('hidden', expenseProblems === 0);
+      $('notice-expense').innerHTML = expenseProblems
+        ? `<b>${expenseProblems} consultant expense actual${expenseProblems === 1 ? '' : 's'} excluded.</b> ` +
+          'A Projectworks currency, stage link, date, or pre-tax amount was missing or did not match. Review the server diagnostics before relying on Consultant Fees to Date.'
+        : '';
+      const missingFields = data.meta.missingCustomFields || [];
+      const customFieldIssue = data.meta.customFieldEntityTypeIssue || '';
+      const hasCustomFieldWarning = missingFields.length > 0 || !!customFieldIssue;
+      $('notice-custom-fields').classList.toggle('hidden', !hasCustomFieldWarning);
+      $('notice-custom-fields').innerHTML = hasCustomFieldWarning
+        ? (missingFields.length
+          ? `<b>Module custom fields not found:</b> ${missingFields.map(esc).join(', ')}. Columns remain blank until those fields exist in SJB. `
+          : '') + (customFieldIssue ? `<span>${esc(customFieldIssue)}</span>` : '')
+        : '';
       render();
       toast('Loaded from Projectworks.');
       tickSync();
@@ -778,13 +821,19 @@
     const cur = sel.value;
     const pms = [...new Set(state.rows.map(r => r.projectManagerName).filter(Boolean))].sort();
     sel.innerHTML = '<option value="">All PMs</option>' +
-      pms.map(p => `<option${p === cur ? ' selected' : ''}>${p}</option>`).join('');
+      pms.map(p => `<option value="${esc(p)}"${p === cur ? ' selected' : ''}>${esc(p)}</option>`).join('');
 
     const tsel = $('f-type');
     const tcur = tsel.value;
     const types = [...new Set(state.rows.map(r => r.projectType).filter(Boolean))].sort();
     tsel.innerHTML = '<option value="">All types</option>' +
-      types.map(t => `<option${t === tcur ? ' selected' : ''}>${t}</option>`).join('');
+      types.map(t => `<option value="${esc(t)}"${t === tcur ? ' selected' : ''}>${esc(t)}</option>`).join('');
+
+    const glsel = $('f-gl');
+    const glcur = glsel.value;
+    const gltypes = [...new Set(state.rows.filter(r => !r.isServices).map(r => r.glCodeTypeName).filter(Boolean))].sort();
+    glsel.innerHTML = '<option value="">All GL types</option>' +
+      gltypes.map(type => `<option value="${esc(type)}"${type === glcur ? ' selected' : ''}>${esc(type)}</option>`).join('');
   }
 
   // ---- filtering -----------------------------------------------------
@@ -792,6 +841,7 @@
     const q = $('f-q').value.trim().toLowerCase();
     const pm = $('f-pm').value;
     const ptype = $('f-type').value;
+    const gltype = $('f-gl').value;
     const showInactive = $('f-inactive').checked;
     const hideZero = $('f-hidezero').checked;
     const noForecastOnly = $('f-noforecast').checked;
@@ -802,8 +852,11 @@
       (!hideZero || r.fee !== 0) &&
       (!pm || r.projectManagerName === pm) &&
       (!ptype || r.projectType === ptype) &&
+      (!gltype || r.glCodeTypeName === gltype) &&
       (!noForecastOnly || (r.remaining !== 0 && Object.keys(r.months).length === 0)) &&
-      (!q || (r.projectName + ' ' + r.stageName + ' ' + r.parentNumber).toLowerCase().includes(q))
+      (!q || [r.projectName, r.stageName, r.parentNumber, r.projectManagerName,
+        r.stageNumber, r.riskStatus, r.fixedHourly, r.glCodeTypeName, r.glCodeCode, r.glCodeName]
+        .join(' ').toLowerCase().includes(q))
     );
   }
 
@@ -840,6 +893,10 @@
       { key: 'parentNumber', label: 'Parent #', text: true, align: 'left', sticky: 'stick s1' },
       { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2', sortable: 'text', sortValue: r => r.projectName },
       { key: 'projectManagerName', label: 'Project manager', text: true, align: 'left', sortable: 'text', sortValue: r => r.projectManagerName },
+      { key: 'currencyCode', label: 'Currency', text: true, align: 'left', sortable: 'text', sortValue: r => r.currencyCode },
+      { key: 'stageNumber', label: 'Stage Number', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
+      { key: 'riskStatus', label: 'Risk Status', text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
+      { key: 'fixedHourly', label: 'Fixed / Hourly', text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
       { key: 'netTotal', label: 'Net total', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.netTotal },
       ...state.months.map(k => ({ key: `month:${k}`, label: monthLabel(k), type: 'money', align: 'right', month: k })),
     ];
@@ -860,7 +917,8 @@
       (showInactive || r.isActive) &&
       (!pm || r.projectManagerName === pm) &&
       (!ptype || r.projectType === ptype) &&
-      (!q || (r.projectName + ' ' + r.parentNumber).toLowerCase().includes(q))
+      (!q || [r.projectName, r.parentNumber, r.projectManagerName, r.stageNumber,
+        r.riskStatus, r.fixedHourly].join(' ').toLowerCase().includes(q))
     );
   }
 
@@ -870,13 +928,14 @@
       const toggle = `<button class="tw" data-pid="${r.projectID}" title="Show planned invoicing and subconsultant fees">${open ? '▾' : '▸'}</button>`;
       return `<td ${cellAttrs(col)}>${toggle}${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
     }
-    if (col.key === 'projectManagerName') return `<td ${cellAttrs(col)}>${esc(r.projectManagerName)}</td>`;
-    if (col.key === 'netTotal') return `<td ${cellAttrs(col, toneClasses(r.netTotal))}>${esc(displayValue(r.netTotal, col))}</td>`;
+    if (['projectManagerName', 'currencyCode'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
+    if (['stageNumber', 'riskStatus', 'fixedHourly'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
+    if (col.key === 'netTotal') return `<td ${cellAttrs(col, toneClasses(r.netTotal))}>${esc(displayValue(r.netTotal, col, r.currencyCode))}</td>`;
     if (col.month) {
       const v = r.months[col.month];
       const p = r.plannedMonths[col.month] || 0;
       const c = r.consultantMonths[col.month] || 0;
-      return `<td ${cellAttrs(col, toneClasses(v), `title="${money(p)} planned invoicing − ${money(c)} subconsultant fees"`)}>${esc(displayValue(v, col))}</td>`;
+      return `<td ${cellAttrs(col, toneClasses(v), `title="${money(p, r.currencyCode)} planned invoicing − ${money(c, r.currencyCode)} subconsultant fees"`)}>${esc(displayValue(v, col, r.currencyCode))}</td>`;
     }
     return `<td ${cellAttrs(col)}></td>`;
   }
@@ -887,11 +946,11 @@
     }
     if (col.key === 'netTotal') {
       const v = r[comp.total];
-      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col))}</td>`;
+      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col, r.currencyCode))}</td>`;
     }
     if (col.month) {
       const v = r[comp.months][col.month];
-      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col))}</td>`;
+      return `<td ${cellAttrs(col, toneClasses(v))}>${esc(displayValue(v, col, r.currencyCode))}</td>`;
     }
     return `<td ${cellAttrs(col)}></td>`;
   }
@@ -903,8 +962,10 @@
    */
   function syncFilterVisibility() {
     const isNet = state.tab === 'net';
+    const isConsultant = state.tab === 'consultant';
     $('f-hidezero-w').classList.toggle('hidden', isNet);
     $('f-noforecast-w').classList.toggle('hidden', isNet);
+    $('f-gl-w').classList.toggle('hidden', !isConsultant);
   }
 
   /** Project row followed by its two component rows, for CSV. */
@@ -917,6 +978,10 @@
           parentNumber: r.parentNumber,
           projectName: `${r.projectName} — ${comp.label}`,
           projectManagerName: r.projectManagerName,
+          stageNumber: r.stageNumber,
+          riskStatus: r.riskStatus,
+          fixedHourly: r.fixedHourly,
+          currencyCode: r.currencyCode,
           netTotal: r[comp.total],
           months: r[comp.months],
         });
@@ -927,12 +992,21 @@
 
   function baseColumns() {
     const feeLabel = state.tab === 'consultant' ? 'Total Budget' : 'Fee';
+    const consultantColumns = state.tab === 'consultant' ? [
+      { key: 'glCodeTypeName', label: 'GL Type', text: true, align: 'left', sortable: 'text', sortValue: r => r.glCodeTypeName },
+      { key: 'glCode', label: 'GL Code', text: true, align: 'left', sortable: 'text', sortValue: r => `${r.glCodeCode} ${r.glCodeName}` },
+    ] : [];
     return [
       { key: 'stat', label: 'Stat', align: 'center', sticky: 'stick s0' },
       { key: 'parentNumber', label: 'Parent #', text: true, align: 'left', sticky: 'stick s1' },
-      { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2' },
-      { key: 'stageNumber', label: 'Stage No.', text: true, align: 'left' },
+      { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2', sortable: 'text', sortValue: r => r.projectName },
+      { key: 'projectManagerName', label: 'Project Manager', text: true, align: 'left', sortable: 'text', sortValue: r => r.projectManagerName },
+      { key: 'currencyCode', label: 'Currency', text: true, align: 'left', sortable: 'text', sortValue: r => r.currencyCode },
+      { key: 'stageNumber', label: 'Stage Number', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
       { key: 'stageName', label: 'Stage Name', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageName },
+      { key: 'riskStatus', label: 'Risk Status', text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
+      { key: 'fixedHourly', label: 'Fixed / Hourly', text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
+      ...consultantColumns,
       { key: 'fee', label: feeLabel, type: 'money', align: 'right', sortable: 'number', sortValue: r => r.fee },
       { key: 'feesToDate', label: 'Fees to Date', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.feesToDate },
       { key: 'remaining', label: 'Remaining', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.remaining },
@@ -994,11 +1068,11 @@
     return `data-col="${esc(col.key)}" class="${cls}" style="${styleFor(col)}"${more ? ' ' + more : ''}`;
   }
 
-  function displayValue(value, col) {
+  function displayValue(value, col, currencyCode = state.defaultCurrency) {
     if (value === '' || value == null) return '';
     const n = Number(value);
     const mode = metaFor(col).displayAs;
-    if (mode === 'currency' || (mode === 'auto' && col.type === 'money')) return money(n);
+    if (mode === 'currency' || (mode === 'auto' && col.type === 'money')) return money(n, currencyCode);
     if (mode === 'percentage') return Number.isNaN(n) ? String(value) : `${numberFmt.format(n * 100)}%`;
     if (mode === 'number' || (mode === 'auto' && col.type === 'number')) return Number.isNaN(n) ? String(value) : numberFmt.format(n);
     return String(value);
@@ -1156,16 +1230,31 @@
     if (col.key === 'projectName') {
       return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
     }
+    if (['projectManagerName', 'currencyCode'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
     if (col.key === 'stageNumber') return `<td ${cellAttrs(col)}>${esc(r.stageNumber)}</td>`;
     if (col.key === 'stageName') {
       return `<td ${cellAttrs(col)}>${rowState.toggle}${pwLink(`/Project/Budgets/${r.projectID}`, esc(r.stageName), 'Open project budgets in Projectworks')}</td>`;
     }
+    if (['riskStatus', 'fixedHourly', 'glCodeTypeName'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
+    if (col.key === 'glCode') {
+      const value = [r.glCodeCode, r.glCodeName].filter(Boolean).join(' — ');
+      return `<td ${cellAttrs(col)}>${esc(value)}</td>`;
+    }
     if (col.key === 'fee') {
-      const inner = pwLink(`/Project/Forecasting/${r.projectID}`, esc(displayValue(r.fee, col)), 'Open project forecasting in Projectworks');
+      const inner = pwLink(`/Project/Forecasting/${r.projectID}`, esc(displayValue(r.fee, col, r.currencyCode)), 'Open project forecasting in Projectworks');
       return `<td ${cellAttrs(col, toneClasses(r.fee))}>${inner}</td>`;
     }
-    if (col.key === 'feesToDate') return `<td ${cellAttrs(col, toneClasses(r.feesToDate))}>${esc(displayValue(r.feesToDate, col))}</td>`;
-    if (col.key === 'remaining') return `<td ${cellAttrs(col, toneClasses(r.remaining))}>${esc(displayValue(r.remaining, col))}</td>`;
+    if (col.key === 'feesToDate') {
+      const actualBreakdown = !r.isServices
+        ? Object.entries(r.actualMonths || {}).sort().map(([month, value]) => `${month}: ${money(value, r.currencyCode)}`).join(' · ')
+        : '';
+      const issue = r.expenseCurrencyIssueCount
+        ? `${r.expenseCurrencyIssueCount} expense actual${r.expenseCurrencyIssueCount === 1 ? '' : 's'} excluded for missing or mismatched currency.`
+        : (r.isServices ? 'Approved invoice amount to date.' :
+          `Approved expense actuals before tax, through today.${actualBreakdown ? ` Monthly actuals: ${actualBreakdown}` : ''}`);
+      return `<td ${cellAttrs(col, toneClasses(r.feesToDate), `title="${esc(issue)}"`)}>${esc(displayValue(r.feesToDate, col, r.currencyCode))}</td>`;
+    }
+    if (col.key === 'remaining') return `<td ${cellAttrs(col, toneClasses(r.remaining))}>${esc(displayValue(r.remaining, col, r.currencyCode))}</td>`;
     if (col.month) {
       // A store-sourced row is derived, never typed into: its value is the sum
       // of the supplier lines beneath it. That holds whether or not any lines
@@ -1177,7 +1266,7 @@
         const title = n
           ? `App-side total of ${n} supplier line${n === 1 ? '' : 's'} — not sent to Projectworks`
           : 'No supplier lines yet — expand this stage and add one to plan an amount';
-        return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="${title}"`)}>${esc(displayValue(v, col))}</td>`;
+        return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="${title}"`)}>${esc(displayValue(v, col, r.currencyCode))}</td>`;
       }
       const v = r.months[col.month];
       return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-row="${i}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
@@ -1213,7 +1302,9 @@
     if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
     if (col.key === 'remaining') value = tot(r => r.remaining);
     if (col.month) value = tot(r => r.months[col.month] || 0);
-    const inner = label || esc(displayValue(value, col));
+    const currencies = [...new Set(rows.map(r => r.currencyCode).filter(Boolean))];
+    const mixedCurrencies = col.type === 'money' && currencies.length > 1;
+    const inner = label || (mixedCurrencies ? 'Mixed currencies' : esc(displayValue(value, col, currencies[0] || '')));
     return `<td ${cellAttrs(col, [label ? 'txt' : '', ...toneClasses(value)])}>${inner}</td>`;
   }
 
@@ -1387,7 +1478,7 @@
       const rolledCell = $('body').querySelector(`td.rolled[data-mid="${row.moduleID}"][data-month="${month}"]`);
       if (rolledCell) {
         const monthCol = state.cols.find(c => c.month === month) || { key: `month:${month}`, type: 'money', align: 'right' };
-        rolledCell.textContent = displayValue(row.months[month], monthCol);
+        rolledCell.textContent = displayValue(row.months[month], monthCol, row.currencyCode);
         rolledCell.classList.remove('neg', 'zero');
         toneClasses(row.months[month]).forEach(cls => rolledCell.classList.add(cls));
         rolledCell.classList.toggle('zero', row.months[month] === 0);
@@ -1477,6 +1568,7 @@
     // cheap refresh of totals after an edit without rebuilding inputs
     const foot = $('foot');
     const tot = (fn) => rows.reduce((s, r) => s + fn(r), 0);
+    const currencies = [...new Set(rows.map(r => r.currencyCode).filter(Boolean))];
     foot.querySelectorAll('td[data-col]').forEach(cell => {
       const col = state.cols.find(c => c.key === cell.dataset.col);
       if (!col) return;
@@ -1487,7 +1579,9 @@
       if (col.key === 'remaining') value = tot(r => r.remaining);
       if (col.month) value = tot(r => r.months[col.month] || 0);
       if (value == null) return;
-      cell.textContent = displayValue(value, col);
+      cell.textContent = col.type === 'money' && currencies.length > 1
+        ? 'Mixed currencies'
+        : displayValue(value, col, currencies[0] || '');
       cell.classList.remove('neg', 'zero');
       toneClasses(value).forEach(cls => cell.classList.add(cls));
     });
@@ -1538,7 +1632,7 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !$('colmodal').classList.contains('hidden')) closeColumnModal();
   });
-  ['f-q', 'f-pm', 'f-type', 'f-inactive', 'f-hidezero', 'f-noforecast'].forEach(id =>
+  ['f-q', 'f-pm', 'f-type', 'f-gl', 'f-inactive', 'f-hidezero', 'f-noforecast'].forEach(id =>
     $(id).addEventListener('input', render));
   document.querySelectorAll('.tab').forEach(b =>
     b.addEventListener('click', () => {

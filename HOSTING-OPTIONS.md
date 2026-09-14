@@ -1,5 +1,12 @@
 # Billing Forecast Utility — Hosting Options
 
+> **Historical only.** This comparison predates the Postgres migration and the
+> built-in browser authentication. The current SJB build uses Postgres, gates every
+> user-facing route with HTTP Basic authentication, provides a database-backed
+> `/healthz` endpoint, and includes a deployable `render.yaml`. Use `README.md` and
+> `SJB-CONNECTION-CHECKLIST.md` for current deployment instructions. Do not deploy
+> the flat-file architecture described below for SJB.
+
 Reference document. Four viable options, assessed on cost, difficulty, delivery time, and
 ongoing burden. Platform pricing and limits are current as of writing and should be re-checked
 before committing.

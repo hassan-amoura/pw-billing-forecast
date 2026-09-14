@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test",
     "migrate:store": "node scripts/migrate-store.js",
     "backup:export": "node scripts/export-backup.js"
   },

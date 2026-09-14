@@ -39,8 +39,8 @@ function readStorageConfig(env = process.env) {
     }
   }
 
-  if (!['disable', 'require'].includes(sslMode)) {
-    errors.push('DATABASE_SSL_MODE must be set to "disable" or "require".');
+  if (!['disable', 'require', 'verify-full'].includes(sslMode)) {
+    errors.push('DATABASE_SSL_MODE must be set to "disable", "require", or "verify-full".');
   }
   if (!instanceId) {
     errors.push('INSTANCE_ID is not set (stable identifier for this deployment and tenant).');
@@ -160,7 +160,9 @@ function createStorage(config) {
 
   const pool = new Pool({
     connectionString: config.connectionString,
-    ssl: config.sslMode === 'require' ? { rejectUnauthorized: false } : false,
+    ssl: config.sslMode === 'disable'
+      ? false
+      : { rejectUnauthorized: config.sslMode === 'verify-full' },
     connectionTimeoutMillis: 10_000,
   });
 
@@ -307,6 +309,10 @@ function createStorage(config) {
     }
     const trimmedAuditEntries = await trimAuditLog();
     return { ...seedResult, trimmedAuditEntries };
+  }
+
+  async function ping() {
+    await pool.query('SELECT 1');
   }
 
   async function querySupplierLines(queryable, moduleID) {
@@ -459,7 +465,7 @@ function createStorage(config) {
     };
   }
 
-  async function setSupplierLineMonth(client, idValue, month, amountValue) {
+  async function setSupplierLineMonth(client, idValue, month, amountValue, expectedValue) {
     const id = asSafeInteger(idValue, 'supplier line id');
     const amount = asFiniteNumber(amountValue, 'supplier line amount');
     if (!MONTH_PATTERN.test(month)) throw new Error('supplier line month must be YYYY-MM');
@@ -477,6 +483,16 @@ function createStorage(config) {
       [id, month]
     );
     const from = oldResult.rowCount ? asFiniteNumber(oldResult.rows[0].amount, 'supplier month amount') : '';
+    if (expectedValue !== undefined) {
+      const expected = expectedValue === '' ? 0 : asFiniteNumber(expectedValue, 'expected supplier line amount');
+      const actual = from === '' ? 0 : from;
+      if (Math.abs(actual - expected) > 0.000001) {
+        const err = new Error('This supplier value changed after the grid was loaded. Reload before editing it again.');
+        err.status = 409;
+        err.code = 'ECONFLICT';
+        throw err;
+      }
+    }
     await client.query(
       `INSERT INTO supplier_line_months (line_id, month, amount)
        VALUES ($1, $2, $3)
@@ -529,7 +545,7 @@ function createStorage(config) {
       await client.query('BEGIN');
       const result = await work({
         createSupplierLine: (input) => createSupplierLine(client, input),
-        setSupplierLineMonth: (id, month, amount) => setSupplierLineMonth(client, id, month, amount),
+        setSupplierLineMonth: (id, month, amount, expected) => setSupplierLineMonth(client, id, month, amount, expected),
         deleteSupplierLine: (id) => deleteSupplierLine(client, id),
         appendAudit: (entry) => insertAudit(client, entry),
       });
@@ -651,6 +667,7 @@ function createStorage(config) {
 
   return {
     initialize,
+    ping,
     getSupplierLines,
     getAudit,
     transaction,

@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: sjb-billing-forecast
+    runtime: node
+    plan: 0.5c-512mb
+    buildCommand: npm ci && npm test
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeployTrigger: "off"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AUTH_MODE
+        value: basic
+      - key: AUTH_DISABLED
+        value: "false"
+      - key: ALLOW_WRITES
+        value: "false"
+      - key: SEED_DEMO_DATA
+        value: "false"
+      - key: DATABASE_SSL_MODE
+        value: verify-full
+      - key: PW_REQUEST_TIMEOUT_MS
+        value: "30000"
+      - key: MODULE_CUSTOM_FIELD_LABELS
+        value: Stage Number,Risk Status,Fixed / Hourly
+      - key: DEFAULT_STAGE_SORT
+        value: stageName
+      - key: BASIC_AUTH_USER
+        sync: false
+      - key: BASIC_AUTH_PASSWORD
+        sync: false
+      - key: PW_BASE_URL
+        sync: false
+      - key: PW_USERNAME
+        sync: false
+      - key: PW_PASSWORD
+        sync: false
+      - key: PW_TENANT_LOCK
+        sync: false
+      - key: PW_APP_BASE_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: INSTANCE_ID
+        sync: false
+      - key: INVOICE_STATUS_CODES
+        sync: false
+      - key: EXPENSE_STATUS_CODES
+        sync: false

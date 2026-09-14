@@ -8,6 +8,7 @@
  *   3. Read and write the app-side consultant plan and audit trail in Postgres.
  *
  * Endpoints:
+ *   GET  /healthz                — unauthenticated database-backed host probe
  *   GET  /api/health              — config sanity check for the UI
  *   GET  /api/users               — safe Projectworks user picker data
  *   GET  /api/grid?start&end      — { rows, netRows, supplierLines, meta }
@@ -47,6 +48,17 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const { createStorage, readStorageConfig } = require('./storage');
+const {
+  aggregateExpenseActuals,
+  aggregateForecasts,
+  aggregateInvoiceFees,
+  buildNetRows,
+  collectPages,
+  firstValue,
+  isMonth,
+  moduleMonthTotals,
+  resolveModuleCustomFields,
+} = require('./app-logic');
 
 const BASE_URL = (process.env.PW_BASE_URL || '').replace(/\/+$/, '');
 const APP_BASE_URL = (process.env.PW_APP_BASE_URL || '').replace(/\/+$/, '');
@@ -60,6 +72,22 @@ const STATUS_CODES = (process.env.INVOICE_STATUS_CODES || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const EXPENSE_STATUS_CODES = (process.env.EXPENSE_STATUS_CODES || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const MODULE_CUSTOM_FIELD_LABELS = (process.env.MODULE_CUSTOM_FIELD_LABELS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const MODULE_CUSTOM_FIELD_KEYS = ['stageNumber', 'riskStatus', 'fixedHourly'];
+const MODULE_CUSTOM_FIELDS = MODULE_CUSTOM_FIELD_KEYS.map((key, index) => ({
+  key,
+  label: MODULE_CUSTOM_FIELD_LABELS[index] || '',
+}));
+const MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID = String(process.env.MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID || '').trim();
+const DEFAULT_STAGE_SORT = String(process.env.DEFAULT_STAGE_SORT || '').trim();
+const PW_REQUEST_TIMEOUT_MS = Number(process.env.PW_REQUEST_TIMEOUT_MS);
 
 // Hosted deployments hand the port in via the environment and require binding
 // to every interface; 0.0.0.0 is not configurable on purpose.
@@ -78,8 +106,25 @@ function refuseToStart(lines) {
   process.exit(1);
 }
 
+function isSecureServiceUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' ||
+      (parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname));
+  } catch {
+    return false;
+  }
+}
+
 const missingConfig = [];
 if (!BASE_URL) missingConfig.push('PW_BASE_URL is not set (Projectworks Open API base URL).');
+else if (!isSecureServiceUrl(BASE_URL)) missingConfig.push('PW_BASE_URL must be a valid HTTPS URL (HTTP is allowed only for localhost testing).');
+if (APP_BASE_URL && !isSecureServiceUrl(APP_BASE_URL)) {
+  missingConfig.push('PW_APP_BASE_URL must be a valid HTTPS URL when set.');
+}
+if (!Number.isSafeInteger(PW_REQUEST_TIMEOUT_MS) || PW_REQUEST_TIMEOUT_MS < 1000 || PW_REQUEST_TIMEOUT_MS > 120000) {
+  missingConfig.push('PW_REQUEST_TIMEOUT_MS must be an integer from 1000 to 120000.');
+}
 if (!TENANT_LOCK) {
   missingConfig.push(
     'PW_TENANT_LOCK is not set (the expected Projectworks tenant name — the office ' +
@@ -96,6 +141,18 @@ if (!['basic', 'header'].includes(AUTH_MODE)) {
   if (!process.env.PW_AUTH_HEADER_NAME) missingConfig.push('PW_AUTH_HEADER_NAME is not set (required when AUTH_MODE=header).');
   if (!process.env.PW_AUTH_HEADER_VALUE) missingConfig.push('PW_AUTH_HEADER_VALUE is not set (required when AUTH_MODE=header).');
 }
+if (!EXPENSE_STATUS_CODES.length) {
+  missingConfig.push('EXPENSE_STATUS_CODES is not set (approved expense-claim status IDs for Consultant Fees to Date).');
+}
+if (!STATUS_CODES.length) {
+  missingConfig.push('INVOICE_STATUS_CODES is not set (approved invoice statuses for Gross Fees to Date).');
+}
+if (MODULE_CUSTOM_FIELD_LABELS.length !== MODULE_CUSTOM_FIELD_KEYS.length) {
+  missingConfig.push('MODULE_CUSTOM_FIELD_LABELS must contain exactly three comma-separated labels: Stage Number, Risk Status, Fixed / Hourly.');
+}
+if (!['stageName', 'stageNumber'].includes(DEFAULT_STAGE_SORT)) {
+  missingConfig.push('DEFAULT_STAGE_SORT must be "stageName" or "stageNumber".');
+}
 missingConfig.push(...STORAGE_CONFIG.errors);
 if (missingConfig.length) refuseToStart(missingConfig);
 
@@ -111,8 +168,9 @@ function authHeaders() {
 
 // ---- browser-facing gate (HTTP Basic) --------------------------------------
 // This app is deployed on a public URL with a live API token and write access,
-// so every route — including the static file handler — sits behind this gate.
-// It fails closed: no password, no server, unless AUTH_DISABLED=true says so.
+// so every user-facing route, including the static file handler, sits behind
+// this gate. /healthz is the sole exception and returns no tenant data. The
+// gate fails closed: no password, no server, unless AUTH_DISABLED=true says so.
 const AUTH_DISABLED = process.env.AUTH_DISABLED === 'true';
 const BASIC_AUTH_USER = process.env.BASIC_AUTH_USER || '';
 const BASIC_AUTH_PASSWORD = process.env.BASIC_AUTH_PASSWORD || '';
@@ -125,7 +183,8 @@ if (!AUTH_DISABLED) {
     refuseToStart([
       ...missingAuth,
       '',
-      'Every route is gated behind HTTP Basic auth. Set both variables, or set',
+      'Every user-facing route is gated behind HTTP Basic auth. Set both',
+      'variables, or set',
       'AUTH_DISABLED=true to run with no gate at all (local development only).',
     ]);
   }
@@ -175,107 +234,6 @@ function requireBasicAuth(req, res, next) {
 // only runtime store for supplier lines and audit entries; data/store.json is
 // retained solely as the source for the one-time migration.
 
-/**
- * The app-side rollup: the total planned across every supplier line on a
- * module for one month. This is the read-side definition used to compose the
- * grid from the supplier-line rows returned by Postgres.
- * It is a planning figure and is never sent to Projectworks.
- */
-function moduleMonthTotal(supplierLines, moduleID, month) {
-  return supplierLines
-    .filter((l) => l.moduleID === moduleID)
-    .reduce((s, l) => s + (Number(l.months[month]) || 0), 0);
-}
-
-/**
- * Net position: one row per PROJECT, aggregated from the stage rows the grid
- * has already built. Deriving it from those rows rather than re-reading the
- * sources is deliberate — the two components are then the same numbers the
- * Gross fees and Consultant fees tabs display, by construction, and cannot
- * drift from them.
- *
- *   plannedMonths     sum of month values across the project's SERVICES stages
- *                     (Projectworks Forecasts — what the customer plans to
- *                     invoice its clients)
- *   consultantMonths  sum of month values across the project's NON-SERVICES
- *                     stages (this app's store — subconsultant fees it expects
- *                     to be charged; never read from Projectworks)
- *   months            net = planned − consultant, per month
- *
- * Read-only, and no new source of truth: nothing here writes anywhere.
- */
-function buildNetRows(rows, inWindow) {
-  const byProject = new Map();
-
-  for (const r of rows) {
-    let n = byProject.get(r.projectID);
-    if (!n) {
-      n = {
-        projectID: r.projectID,
-        parentNumber: r.parentNumber,
-        projectName: r.projectName || `Project ${r.projectID}`,
-        projectManagerName: r.projectManagerName,
-        projectType: r.projectType,
-        isActive: false,
-        servicesStages: 0,
-        consultantStages: 0,
-        plannedMonths: {},
-        consultantMonths: {},
-        months: {},
-      };
-      byProject.set(r.projectID, n);
-    }
-    if (r.isActive) n.isActive = true;
-    if (r.isServices) n.servicesStages++; else n.consultantStages++;
-
-    const bucket = r.isServices ? n.plannedMonths : n.consultantMonths;
-    for (const [month, value] of Object.entries(r.months)) {
-      if (!inWindow(month)) continue;
-      bucket[month] = (bucket[month] || 0) + (Number(value) || 0);
-    }
-  }
-
-  const out = [];
-  for (const n of byProject.values()) {
-    // Same emptiness reasoning the other tabs use for "no forecast": a project
-    // counts as having something to show when a month KEY exists, so a stage
-    // deliberately forecast at 0 still renders, and a project with neither a
-    // forecast nor a supplier line in the window is dropped rather than
-    // rendered as a row of blanks.
-    const plannedKeys = Object.keys(n.plannedMonths);
-    const consultantKeys = Object.keys(n.consultantMonths);
-    if (!plannedKeys.length && !consultantKeys.length) continue;
-
-    for (const month of new Set([...plannedKeys, ...consultantKeys])) {
-      n.months[month] = (n.plannedMonths[month] || 0) - (n.consultantMonths[month] || 0);
-    }
-    const total = (obj) => Object.values(obj).reduce((s, v) => s + (Number(v) || 0), 0);
-    n.plannedTotal = total(n.plannedMonths);
-    n.consultantTotal = total(n.consultantMonths);
-    n.netTotal = n.plannedTotal - n.consultantTotal;
-    out.push(n);
-  }
-
-  out.sort((a, b) =>
-    String(a.parentNumber).localeCompare(String(b.parentNumber)) ||
-    String(a.projectName).localeCompare(String(b.projectName))
-  );
-  return out;
-}
-
-/** Every month any supplier line on this module carries, as { 'YYYY-MM': total }. */
-function moduleMonthTotals(supplierLines, moduleID, withinMonths) {
-  const lines = supplierLines.filter((l) => l.moduleID === moduleID);
-  const out = {};
-  for (const line of lines) {
-    for (const month of Object.keys(line.months || {})) {
-      if (withinMonths && !withinMonths(month)) continue;
-      if (out[month] === undefined) out[month] = moduleMonthTotal(lines, moduleID, month);
-    }
-  }
-  return out;
-}
-
 // ---- Projectworks proxy ----------------------------------------------------
 const PAGE_SIZE = 200;
 const MAX_PAGES = 100; // hard stop: 20,000 records per collection
@@ -288,7 +246,18 @@ async function pwGet(pathname, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
   }
-  const res = await fetch(url, { headers: { Accept: 'application/json', ...authHeaders() } });
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Accept: 'application/json', ...authHeaders() },
+      signal: AbortSignal.timeout(PW_REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    throw new Error(
+      `GET ${pathname} ${timedOut ? `timed out after ${PW_REQUEST_TIMEOUT_MS}ms` : `failed: ${String(err.message || err)}`}`
+    );
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     const err = new Error(`GET ${pathname} → ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
@@ -300,17 +269,10 @@ async function pwGet(pathname, params = {}) {
 
 /** Page through a collection endpoint until a short page comes back. */
 async function pwGetAll(pathname, params = {}) {
-  const out = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const batch = await pwGet(pathname, { ...params, page, pageSize: PAGE_SIZE });
-    if (!Array.isArray(batch)) {
-      throw new Error(`GET ${pathname} returned a non-array response; check the endpoint shape.`);
-    }
-    out.push(...batch);
-    if (batch.length < PAGE_SIZE) return out;
-  }
-  console.warn(`GET ${pathname}: hit MAX_PAGES (${MAX_PAGES}); results may be truncated.`);
-  return out;
+  return collectPages(
+    (page, pageSize) => pwGet(pathname, { ...params, page, pageSize }),
+    { pageSize: PAGE_SIZE, maxPages: MAX_PAGES, label: `GET ${pathname}` }
+  );
 }
 
 function collectionFromResponse(payload) {
@@ -326,6 +288,89 @@ function collectionFromResponse(payload) {
     }
   }
   return [payload];
+}
+
+function canonicalJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJSON(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function loadModuleCustomFieldDefinitions() {
+  let entityTypeID = MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID;
+  let entityTypeSource = entityTypeID ? 'configured' : 'unresolved';
+  let entityTypeIssue = '';
+
+  if (!entityTypeID) {
+    try {
+      const types = await pwGet('/api/v1/CustomFields/EntityTypes');
+      if (!Array.isArray(types)) throw new Error('returned a non-array response');
+      const moduleType = types.find((type) => ['module', 'modules'].includes(
+        String(firstValue(type, ['Name', 'name']) || '').trim().toLowerCase()
+      ));
+      if (moduleType) {
+        entityTypeID = String(firstValue(moduleType, ['EntityTypeID', 'entityTypeID']) || '');
+        entityTypeSource = entityTypeID ? 'discovered' : 'unresolved';
+      } else {
+        entityTypeIssue = 'Projectworks did not return an entity type named Module.';
+      }
+    } catch (err) {
+      entityTypeIssue = `Module custom-field entity type could not be discovered: ${String(err.message || err)}`;
+    }
+  }
+
+  const scope = entityTypeID ? { EntityTypeID: entityTypeID } : {};
+  const [rawDefinitions, ...labelGroups] = await Promise.all([
+    pwGetAll('/api/v1/CustomFields', scope),
+    ...MODULE_CUSTOM_FIELDS.map((field) => pwGetAll('/api/v1/CustomFields', { ...scope, Label: field.label })),
+  ]);
+  const definitions = rawDefinitions.map((definition) => ({
+    ...definition,
+    ...(entityTypeID ? { __entityTypeID: entityTypeID } : {}),
+  }));
+  const additions = [];
+
+  MODULE_CUSTOM_FIELDS.forEach((field, groupIndex) => {
+    for (const candidate of labelGroups[groupIndex]) {
+      const candidateID = firstValue(candidate, ['FieldID', 'fieldID', 'fieldId', 'ID', 'id']);
+      let matchingIndexes = [];
+      if (candidateID !== undefined && candidateID !== null) {
+        matchingIndexes = definitions
+          .map((definition, index) => ({ definition, index }))
+          .filter(({ definition }) => String(firstValue(definition, ['FieldID', 'fieldID', 'fieldId', 'ID', 'id'])) === String(candidateID))
+          .map(({ index }) => index);
+      }
+      if (!matchingIndexes.length) {
+        const signature = canonicalJSON(candidate);
+        matchingIndexes = definitions
+          .map((definition, index) => ({ definition, index }))
+          .filter(({ definition }) => canonicalJSON(rawDefinitions[index]) === signature)
+          .map(({ index }) => index);
+      }
+
+      if (matchingIndexes.length === 1) {
+        definitions[matchingIndexes[0]].__configuredLabel = field.label;
+      } else {
+        // A labelled query result can still match a module value by field ID
+        // even when the full definition collection did not expose enough
+        // identity to locate its ordinal position.
+        additions.push({
+          ...candidate,
+          __configuredLabel: field.label,
+          ...(entityTypeID ? { __entityTypeID: entityTypeID } : {}),
+        });
+      }
+    }
+  });
+
+  return {
+    definitions: [...definitions, ...additions],
+    entityTypeID,
+    entityTypeSource,
+    entityTypeIssue,
+  };
 }
 
 // ---- tenant lock -----------------------------------------------------------
@@ -367,7 +412,7 @@ async function resolveTenantOfficeNames() {
   }
   const names = new Set();
   for (const p of projects) {
-    const name = String(p?.OfficeName || '').trim();
+    const name = String(firstValue(p, ['OfficeName', 'officeName']) || '').trim();
     if (name) names.add(name);
   }
   return [...names].sort((a, b) => a.localeCompare(b));
@@ -541,12 +586,10 @@ async function getProjectworksUsers(force = false) {
   if (!force && usersCache.users.length && Date.now() - usersCache.at < USER_CACHE_MS) {
     return usersCache.users;
   }
-  const out = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const batch = await fetchProjectworksUsers({ page, pageSize: USER_PAGE_SIZE });
-    out.push(...batch);
-    if (batch.length < USER_PAGE_SIZE) break;
-  }
+  const out = await collectPages(
+    (page, pageSize) => fetchProjectworksUsers({ page, pageSize }),
+    { pageSize: USER_PAGE_SIZE, maxPages: MAX_PAGES, label: 'GET /api/v1/Users' }
+  );
   const users = out
     .map(normalizeProjectworksUser)
     .filter(Boolean)
@@ -587,7 +630,7 @@ let modulesCache = { at: 0, byID: new Map() };
 function cacheModules(modules) {
   modulesCache = {
     at: Date.now(),
-    byID: new Map(modules.map((m) => [String(m.ModuleID), m])),
+    byID: new Map(modules.map((m) => [String(firstValue(m, ['ModuleID', 'moduleID'])), m])),
   };
 }
 
@@ -630,7 +673,7 @@ async function assertServicesModule(moduleID) {
   if (!module) {
     throw httpError(400, `Module ${moduleID} was not found in Projectworks, so nothing was written.`);
   }
-  if (!module.IsServices) {
+  if (!firstValue(module, ['IsServices', 'isServices'])) {
     throw httpError(
       403,
       `Module ${moduleID} is a consultant (non-services) module. Subconsultant fees are ` +
@@ -639,6 +682,27 @@ async function assertServicesModule(moduleID) {
     );
   }
   return module;
+}
+
+async function assertConsultantModule(moduleID) {
+  let module;
+  try {
+    module = await getModuleByID(moduleID);
+  } catch (err) {
+    throw httpError(502, `Module ${moduleID} could not be checked against Projectworks, so nothing was saved: ${String(err.message || err)}`);
+  }
+  if (!module) throw httpError(400, `Module ${moduleID} was not found in Projectworks, so nothing was saved.`);
+  if (firstValue(module, ['IsServices', 'isServices'])) {
+    throw httpError(403, `Module ${moduleID} is a services module. Supplier planning lines may only be attached to consultant modules.`);
+  }
+  return module;
+}
+
+async function supplierLineForWrite(id) {
+  const line = (await storage.getSupplierLines()).find((candidate) => candidate.id === id);
+  if (!line) throw httpError(404, `supplier line ${id} not found`);
+  await assertConsultantModule(line.moduleID);
+  return line;
 }
 
 async function resolveSelectedAuditUser(body) {
@@ -659,7 +723,7 @@ function sendUserResolveError(res, err) {
 
 function sendStoreError(res, err, note) {
   console.error(err);
-  return res.status(500).json({
+  return res.status(err.status || 500).json({
     error: String((err && err.message) || err) + (note ? ` ${note}` : ''),
   });
 }
@@ -678,6 +742,7 @@ async function pwSetForecast(moduleID, month, amount, comment) {
     const r = await fetch(new URL(BASE_URL + '/api/v1/Forecasts/Set'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authHeaders() },
+      signal: AbortSignal.timeout(PW_REQUEST_TIMEOUT_MS),
       body: JSON.stringify({
         moduleID,
         date: `${month}-01`,
@@ -693,89 +758,134 @@ async function pwSetForecast(moduleID, month, amount, comment) {
   }
 }
 
+async function pwForecastAmount(moduleID, month) {
+  const forecasts = await pwGetAll('/api/v1/Forecasts', {
+    ModuleID: moduleID,
+    StartDate: `${month}-01`,
+    EndDate: monthEndDate(month),
+  });
+  const monthly = aggregateForecasts(forecasts).get(String(moduleID)) || {};
+  return Object.prototype.hasOwnProperty.call(monthly, month) ? monthly[month] : 0;
+}
+
 function monthKey(dateStr) {
   // Forecast/invoice dates arrive as ISO strings; bucket to YYYY-MM.
   return String(dateStr).slice(0, 7);
 }
 
+function monthEndDate(month) {
+  const [year, monthNumber] = String(month).split('-').map(Number);
+  return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+}
+
 /** Build the composed grid: one row per module (stage). */
 async function buildGrid(startMonth, endMonth) {
-  // Forecasts are date-bounded to the requested window; the other Projectworks
-  // collections are full pulls (fees to date is all-time). Supplier lines are
-  // read from Postgres in parallel and never from Projectworks.
-  // The live API returns PascalCase fields (ModuleID, Budget, IsServices, …)
-  // — verified against the sandbox tenant, not the swagger's casing.
+  // Consultant Fees to Date is actual pre-tax expense spend through today.
+  // Consultant month cells remain app-side planning values; the actual monthly
+  // buckets are returned separately for reconciliation and future drill-down.
   const forecastStart = `${startMonth}-01`;
-  const [projects, modules, invoices, forecasts, supplierLines] = await Promise.all([
+  const asOfDate = new Date().toISOString().slice(0, 10);
+  const [projects, modules, invoices, forecasts, expenseClaims, customFieldConfig, supplierLines] = await Promise.all([
     pwGetAll('/api/v1/Projects'),
-    pwGetAll('/api/v1/Modules'),
+    pwGetAll('/api/v1/Modules', { IncludeCustomFields: true }),
     pwGetAll('/api/v1/Invoices'),
-    pwGetAll('/api/v1/Forecasts', { StartDate: forecastStart, EndDate: `${endMonth}-28` }),
+    pwGetAll('/api/v1/Forecasts', { StartDate: forecastStart, EndDate: monthEndDate(endMonth) }),
+    pwGetAll('/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false }),
+    loadModuleCustomFieldDefinitions(),
     storage.getSupplierLines(),
   ]);
+  const customFieldDefinitions = customFieldConfig.definitions;
 
   // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
   cacheModules(modules);
 
-  const projectById = new Map(projects.map((p) => [p.ProjectID, p]));
+  const projectById = new Map(projects.map((project) => [
+    String(firstValue(project, ['ProjectID', 'projectID'])),
+    project,
+  ]));
+  const moduleProject = new Map(modules.map((module) => [
+    String(firstValue(module, ['ModuleID', 'moduleID'])),
+    String(firstValue(module, ['ProjectID', 'projectID'])),
+  ]));
+  const projectCurrency = new Map(projects.map((project) => [
+    String(firstValue(project, ['ProjectID', 'projectID'])),
+    firstValue(project, ['CurrencyID', 'currencyID']),
+  ]));
   const inWindow = (m) => m >= startMonth && m <= endMonth; // 'YYYY-MM' sorts lexically
 
-  // Fees to date: sum invoice line amounts by ModuleID, optionally filtered
-  // to configured invoice status codes. Lines ride inside invoice headers.
-  const feesToDate = new Map();
-  const statusesSeen = new Set();
-  for (const inv of invoices) {
-    statusesSeen.add(inv.StatusCode);
-    if (STATUS_CODES.length && !STATUS_CODES.includes(inv.StatusCode)) continue;
-    for (const line of inv.Lines || []) {
-      if (line.ModuleID == null) continue;
-      feesToDate.set(line.ModuleID, (feesToDate.get(line.ModuleID) || 0) + (Number(line.Amount) || 0));
-    }
-  }
-
-  // Forecasts: ModuleID → { 'YYYY-MM': amount }
-  const forecastByModule = new Map();
-  for (const f of forecasts) {
-    if (f.ModuleID == null) continue;
-    const key = monthKey(f.Date);
-    if (!forecastByModule.has(f.ModuleID)) forecastByModule.set(f.ModuleID, {});
-    const bucket = forecastByModule.get(f.ModuleID);
-    bucket[key] = (bucket[key] || 0) + (Number(f.Amount) || 0);
-  }
+  const invoiceActuals = aggregateInvoiceFees(invoices, STATUS_CODES);
+  const expenseActuals = aggregateExpenseActuals(expenseClaims, {
+    allowedStatusIDs: EXPENSE_STATUS_CODES,
+    moduleProject,
+    projectCurrency,
+    asOfDate,
+  });
+  const forecastByModule = aggregateForecasts(forecasts);
+  const customFieldsMatched = new Set();
+  let usedOrdinalCustomFieldMapping = false;
 
   const rows = modules.map((m) => {
-    const p = projectById.get(m.ProjectID) || {};
-    const fee = Number(m.Budget) || 0;
-    const invoiced = feesToDate.get(m.ModuleID) || 0;
+    const moduleIDValue = firstValue(m, ['ModuleID', 'moduleID']);
+    const moduleID = Number(moduleIDValue);
+    const moduleKey = String(moduleIDValue);
+    const projectIDValue = firstValue(m, ['ProjectID', 'projectID']);
+    const projectKey = String(projectIDValue);
+    const p = projectById.get(projectKey) || {};
+    const fee = Number(firstValue(m, ['Budget', 'budget'])) || 0;
+    const isServices = !!firstValue(m, ['IsServices', 'isServices']);
+    const actual = isServices
+      ? (invoiceActuals.totalsByModule.get(moduleKey) || 0)
+      : (expenseActuals.totalsByModule.get(moduleKey) || 0);
+    const custom = resolveModuleCustomFields(
+      m,
+      customFieldDefinitions,
+      MODULE_CUSTOM_FIELDS,
+      customFieldConfig.entityTypeID
+    );
+    for (const key of custom.matched) customFieldsMatched.add(key);
+    if (custom.usedOrdinal) usedOrdinalCustomFieldMapping = true;
     // Two kinds of number, two sources. Services modules (Gross fees) show what
     // the customer plans to invoice, and Projectworks Forecasts is the field of
     // record. Non-services modules (Consultant fees) show subconsultant costs,
     // which live only in this app — reading them back from Projectworks would
     // return whatever the retired rollup last wrote and drift from the supplier
     // lines from the first edit onwards.
-    const isServices = !!m.IsServices;
     const months = isServices
-      ? (forecastByModule.get(m.ModuleID) || {})
-      : moduleMonthTotals(supplierLines, m.ModuleID, inWindow);
+      ? (forecastByModule.get(moduleKey) || {})
+      : moduleMonthTotals(supplierLines, moduleID, inWindow);
+    const currencyIssue = expenseActuals.currencyIssuesByModule.get(moduleKey);
     return {
-      moduleID: m.ModuleID,
-      stat: m.IsActive ? 'A' : 'I',
-      isActive: !!m.IsActive,
+      moduleID,
+      stat: firstValue(m, ['IsActive', 'isActive']) ? 'A' : 'I',
+      isActive: !!firstValue(m, ['IsActive', 'isActive']),
       isServices,
-      parentNumber: p.ProjectNumber || '',
-      stageNumber: m.ExternalReference || '',
-      projectID: m.ProjectID,
-      projectName: p.ProjectName || m.Projectname || '',
-      projectManagerName: p.ProjectManagerName || '',
+      parentNumber: firstValue(p, ['ProjectNumber', 'projectNumber']) || '',
+      projectID: Number(projectIDValue),
+      projectName: firstValue(p, ['ProjectName', 'projectName']) || firstValue(m, ['Projectname', 'projectname']) || '',
+      projectManagerName: firstValue(p, ['ProjectManagerName', 'projectManagerName']) || '',
       // Approximates BQE/Deltek's "Class" filter — not a literal field match.
       // Confirm against SJB's real tenant once migrated; Principal and
       // Originator have no Projectworks equivalent at all and are likely
       // tenant-specific custom fields, so they are not surfaced here.
-      projectType: p.ProjectTypeName || '',
-      stageName: m.ModuleName || '',
+      projectType: firstValue(p, ['ProjectTypeName', 'projectTypeName']) || '',
+      stageName: firstValue(m, ['ModuleName', 'moduleName']) || '',
+      stageNumber: custom.values.stageNumber || '',
+      riskStatus: custom.values.riskStatus || '',
+      fixedHourly: custom.values.fixedHourly || '',
+      glCodeTypeName: firstValue(m, ['GLCodeTypeName', 'glCodeTypeName']) || '',
+      glCodeName: firstValue(m, ['GLCodeName', 'glCodeName']) || '',
+      glCodeCode: firstValue(m, ['GLCodeCode', 'glCodeCode']) || '',
+      glCode: [
+        firstValue(m, ['GLCodeCode', 'glCodeCode']),
+        firstValue(m, ['GLCodeName', 'glCodeName']),
+      ].filter(Boolean).join(' — '),
+      currencyID: firstValue(p, ['CurrencyID', 'currencyID']) || '',
+      currencyCode: firstValue(p, ['CurrencyCode', 'currencyCode']) || '',
       fee,
-      feesToDate: invoiced,
-      remaining: fee - invoiced,
+      feesToDate: actual,
+      remaining: fee - actual,
+      actualMonths: isServices ? {} : (expenseActuals.monthsByModule.get(moduleKey) || {}),
+      expenseCurrencyIssueCount: isServices || !currencyIssue ? 0 : currencyIssue.count,
       months,
       // Which system owns `months`. The UI decides editability from this, not
       // from the active tab, so the two cannot drift apart.
@@ -783,10 +893,27 @@ async function buildGrid(startMonth, endMonth) {
     };
   });
 
+  const missingCustomFields = MODULE_CUSTOM_FIELDS
+    .filter((field) => !customFieldsMatched.has(field.key))
+    .map((field) => field.label);
+  if (missingCustomFields.length) {
+    console.warn(`Configured module custom fields not found in this tenant: ${missingCustomFields.join(', ')}`);
+  }
+  if (usedOrdinalCustomFieldMapping) {
+    console.warn('Module custom fields were matched by ordinal position. Re-check the mapping after any Projectworks custom-field reorder.');
+  }
+  if (customFieldConfig.entityTypeIssue) console.warn(customFieldConfig.entityTypeIssue);
+
   rows.sort((a, b) =>
-    String(a.parentNumber).localeCompare(String(b.parentNumber)) ||
-    String(a.stageName).localeCompare(String(b.stageName))
+    String(a.projectName).localeCompare(String(b.projectName), undefined, { numeric: true, sensitivity: 'base' }) ||
+    String(DEFAULT_STAGE_SORT === 'stageNumber' ? a.stageNumber : a.stageName)
+      .localeCompare(String(DEFAULT_STAGE_SORT === 'stageNumber' ? b.stageNumber : b.stageName), undefined, { numeric: true, sensitivity: 'base' }) ||
+    String(a.stageName).localeCompare(String(b.stageName), undefined, { numeric: true, sensitivity: 'base' })
   );
+
+  const currencyCodes = [...new Set(rows.map((row) => row.currencyCode).filter(Boolean))].sort();
+  const expenseCurrencyIssueCount = [...expenseActuals.currencyIssuesByModule.values()]
+    .reduce((sum, issue) => sum + issue.count, 0);
 
   return {
     rows,
@@ -796,9 +923,29 @@ async function buildGrid(startMonth, endMonth) {
       projects: projects.length,
       modules: modules.length,
       invoices: invoices.length,
+      expenseClaims: expenseClaims.length,
       forecastEntries: forecasts.length,
       invoiceStatusFilter: STATUS_CODES.length ? STATUS_CODES : 'ALL (unfiltered — confirm before demoing revenue figures)',
-      invoiceStatusesSeen: [...statusesSeen].filter(Boolean),
+      invoiceStatusesSeen: [...invoiceActuals.statusesSeen].filter(Boolean),
+      expenseStatusFilter: EXPENSE_STATUS_CODES,
+      expenseStatusesSeen: [...expenseActuals.statusesSeen].filter(Boolean),
+      expenseActualsAsOf: asOfDate,
+      expenseCurrencyIssueCount,
+      expenseMissingModuleCount: expenseActuals.missingModule,
+      expenseMissingAmountCount: expenseActuals.missingAmount,
+      expenseMissingDateCount: expenseActuals.missingDate,
+      expensePlannedExcluded: expenseActuals.plannedExcluded,
+      expenseFutureExcluded: expenseActuals.futureExcluded,
+      missingCustomFields,
+      customFieldMapping: missingCustomFields.length === MODULE_CUSTOM_FIELDS.length
+        ? 'unresolved'
+        : (usedOrdinalCustomFieldMapping ? 'ordinal' : 'identity'),
+      customFieldLabels: MODULE_CUSTOM_FIELD_LABELS,
+      customFieldEntityTypeID: customFieldConfig.entityTypeID,
+      customFieldEntityTypeSource: customFieldConfig.entityTypeSource,
+      customFieldEntityTypeIssue: customFieldConfig.entityTypeIssue,
+      defaultStageSort: DEFAULT_STAGE_SORT,
+      currencyCodes,
       writesEnabled: ALLOW_WRITES,
       baseUrl: BASE_URL,
       tenant: RESOLVED_TENANT ? RESOLVED_TENANT.name : '',
@@ -807,8 +954,34 @@ async function buildGrid(startMonth, endMonth) {
 }
 
 const app = express();
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.set({
+    'Content-Security-Policy': "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+  });
+  if (process.env.NODE_ENV === 'production') {
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
+  next();
+});
+// Hosting health checks need one non-sensitive route that does not require the
+// browser password. The process only begins listening after tenant and storage
+// checks pass; each probe also confirms Postgres remains reachable.
+app.get('/healthz', async (_req, res) => {
+  try {
+    await storage.ping();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`Health check failed: ${String(err.message || err)}`);
+    res.status(503).json({ ok: false });
+  }
+});
 app.use(requireBasicAuth); // first, so the static handler is gated too
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 function writesBlocked(res) {
@@ -817,6 +990,23 @@ function writesBlocked(res) {
     error: 'Writes are disabled. Set ALLOW_WRITES=true in .env to enable edits.',
   });
   return true;
+}
+
+function positiveSafeInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function finiteNumber(value) {
+  if (value === '' || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function monthRangeSize(start, end) {
+  const [startYear, startMonth] = start.split('-').map(Number);
+  const [endYear, endMonth] = end.split('-').map(Number);
+  return (endYear - startYear) * 12 + endMonth - startMonth + 1;
 }
 
 app.get('/api/health', (_req, res) => {
@@ -830,8 +1020,11 @@ app.get('/api/health', (_req, res) => {
     authMode: AUTH_MODE,
     writesEnabled: ALLOW_WRITES,
     invoiceStatusFilter: STATUS_CODES,
-    // false → Fees to Date sums every status, including drafts. The UI raises
-    // a banner on this without waiting for a data load.
+    expenseStatusFilter: EXPENSE_STATUS_CODES,
+    customFieldLabels: MODULE_CUSTOM_FIELD_LABELS,
+    defaultStageSort: DEFAULT_STAGE_SORT,
+    requestTimeoutMs: PW_REQUEST_TIMEOUT_MS,
+    // Required at boot; retained for compatibility with the existing UI.
     invoiceStatusFiltered: STATUS_CODES.length > 0,
     appBaseUrl: APP_BASE_URL,
   });
@@ -839,8 +1032,12 @@ app.get('/api/health', (_req, res) => {
 
 app.get('/api/grid', async (req, res) => {
   const { start, end } = req.query;
-  if (!/^\d{4}-\d{2}$/.test(start || '') || !/^\d{4}-\d{2}$/.test(end || '')) {
+  if (!isMonth(start) || !isMonth(end)) {
     return res.status(400).json({ error: 'start and end are required as YYYY-MM' });
+  }
+  const months = monthRangeSize(start, end);
+  if (months < 1 || months > 36) {
+    return res.status(400).json({ error: 'forecast range must be between 1 and 36 months' });
   }
   try {
     res.json(await buildGrid(start, end));
@@ -862,23 +1059,34 @@ app.get('/api/users', async (_req, res) => {
 app.post('/api/forecast', async (req, res) => {
   if (writesBlocked(res)) return;
   const { moduleID, month, amount, context } = req.body || {};
-  if (moduleID == null || !/^\d{4}-\d{2}$/.test(month || '') || amount == null || Number.isNaN(Number(amount))) {
+  const moduleNumber = positiveSafeInteger(moduleID);
+  const amountNumber = finiteNumber(amount);
+  const ctx = context || {};
+  const hasExpectedValue = Object.prototype.hasOwnProperty.call(ctx, 'from');
+  const expectedAmount = ctx.from === '' ? 0 : finiteNumber(ctx.from);
+  if (!moduleNumber || !isMonth(month) || amountNumber === null || !hasExpectedValue || expectedAmount === null) {
     return res.status(400).json({ error: 'moduleID, month (YYYY-MM) and numeric amount are required' });
   }
   let auditUser;
+  let previousAmount;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
     // The only route that writes to Projectworks, so this is the only place the
     // consultant/services boundary has to hold. It fails closed.
-    await assertServicesModule(moduleID);
+    await assertServicesModule(moduleNumber);
+    // The audit's previous value is read from Projectworks, never trusted from
+    // browser-supplied context. If it cannot be read, the write is refused.
+    previousAmount = await pwForecastAmount(moduleNumber, month);
+    if (Math.abs(previousAmount - expectedAmount) > 0.000001) {
+      throw httpError(409, 'This forecast changed in Projectworks after the grid was loaded. Reload before editing it again.');
+    }
   } catch (err) {
     return sendUserResolveError(res, err);
   }
   // User-selection based audit labeling for demo/internal use only. This is
   // not authenticated identity; secure attribution needs SSO or delegated auth.
-  const ctx = context || {};
   const result = await pwSetForecast(
-    moduleID, month, amount,
+    moduleNumber, month, amountNumber,
     `Set by ${auditUser.name} via PW Billing Forecast tool`
   );
   try {
@@ -891,10 +1099,10 @@ app.post('/api/forecast', async (req, res) => {
         project: ctx.project || '',
         stage: ctx.stage || '',
         supplier: '',
-        moduleID,
+        moduleID: moduleNumber,
         month,
-        from: ctx.from ?? '',
-        to: Number(amount),
+        from: previousAmount,
+        to: amountNumber,
         synced: result.ok,
         ...(result.ok ? {} : { error: result.error }),
       });
@@ -913,7 +1121,9 @@ app.post('/api/forecast', async (req, res) => {
 app.get('/api/supplier-lines', async (req, res) => {
   try {
     const { moduleID } = req.query;
-    const lines = await storage.getSupplierLines(moduleID ? Number(moduleID) : undefined);
+    const moduleNumber = moduleID === undefined ? undefined : positiveSafeInteger(moduleID);
+    if (moduleID !== undefined && !moduleNumber) return res.status(400).json({ error: 'moduleID must be a positive integer' });
+    const lines = await storage.getSupplierLines(moduleNumber);
     res.json({ supplierLines: lines });
   } catch (err) {
     sendStoreError(res, err);
@@ -923,12 +1133,14 @@ app.get('/api/supplier-lines', async (req, res) => {
 app.post('/api/supplier-lines', async (req, res) => {
   if (writesBlocked(res)) return;
   const { moduleID, supplier, description, context } = req.body || {};
-  if (moduleID == null || !supplier || !String(supplier).trim()) {
+  const moduleNumber = positiveSafeInteger(moduleID);
+  if (!moduleNumber || !supplier || !String(supplier).trim()) {
     return res.status(400).json({ error: 'moduleID and supplier are required' });
   }
   let auditUser;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
+    await assertConsultantModule(moduleNumber);
   } catch (err) {
     return sendUserResolveError(res, err);
   }
@@ -936,7 +1148,7 @@ app.post('/api/supplier-lines', async (req, res) => {
   try {
     const line = await storage.transaction(async (tx) => {
       const created = await tx.createSupplierLine({
-        moduleID: Number(moduleID),
+        moduleID: moduleNumber,
         supplier: String(supplier).trim(),
         description: description ? String(description) : '',
       });
@@ -968,21 +1180,25 @@ app.post('/api/supplier-lines', async (req, res) => {
  */
 app.put('/api/supplier-lines/:id/month', async (req, res) => {
   if (writesBlocked(res)) return;
-  const id = Number(req.params.id);
+  const id = positiveSafeInteger(req.params.id);
   const { month, amount, context } = req.body || {};
-  if (!/^\d{4}-\d{2}$/.test(month || '') || amount == null || Number.isNaN(Number(amount))) {
+  const amountNumber = finiteNumber(amount);
+  const ctx = context || {};
+  const hasExpectedValue = Object.prototype.hasOwnProperty.call(ctx, 'from');
+  const expectedAmount = ctx.from === '' ? 0 : finiteNumber(ctx.from);
+  if (!id || !isMonth(month) || amountNumber === null || !hasExpectedValue || expectedAmount === null) {
     return res.status(400).json({ error: 'month (YYYY-MM) and numeric amount are required' });
   }
   let auditUser;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
+    await supplierLineForWrite(id);
   } catch (err) {
     return sendUserResolveError(res, err);
   }
-  const ctx = context || {};
   try {
     const out = await storage.transaction(async (tx) => {
-      const changed = await tx.setSupplierLineMonth(id, month, Number(amount));
+      const changed = await tx.setSupplierLineMonth(id, month, amountNumber, expectedAmount);
       if (!changed) return { status: 404, body: { error: `supplier line ${id} not found` } };
 
       await tx.appendAudit({
@@ -996,7 +1212,7 @@ app.put('/api/supplier-lines/:id/month', async (req, res) => {
         moduleID: changed.line.moduleID,
         month,
         from: changed.from,
-        to: Number(amount),
+        to: amountNumber,
       });
       return { status: 200, body: { ok: true, moduleTotal: changed.moduleTotal } };
     });
@@ -1008,11 +1224,13 @@ app.put('/api/supplier-lines/:id/month', async (req, res) => {
 
 app.delete('/api/supplier-lines/:id', async (req, res) => {
   if (writesBlocked(res)) return;
-  const id = Number(req.params.id);
+  const id = positiveSafeInteger(req.params.id);
   const { context } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'supplier line id must be a positive integer' });
   let auditUser;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
+    await supplierLineForWrite(id);
   } catch (err) {
     return sendUserResolveError(res, err);
   }
@@ -1088,24 +1306,13 @@ app.get('/api/audit', async (_req, res) => {
     if (AUTH_DISABLED) {
       console.warn('');
       console.warn('  ****************************************************************');
-      console.warn('  *  WARNING: AUTH_DISABLED=true — every route is open to anyone  *');
+      console.warn('  *  WARNING: AUTH_DISABLED=true — user-facing routes are open   *');
       console.warn('  *  who can reach this server, including the write endpoints.    *');
       console.warn('  *  Never set this on a hosted or public deployment.             *');
       console.warn('  ****************************************************************');
       console.warn('');
     }
 
-    if (!STATUS_CODES.length) {
-      console.warn('');
-      console.warn('  ****************************************************************');
-      console.warn('  *  WARNING: INVOICE_STATUS_CODES is not set.                    *');
-      console.warn('  *  Fees to Date is UNFILTERED — it sums every invoice status,   *');
-      console.warn('  *  including drafts and unapproved invoices, so the revenue     *');
-      console.warn('  *  figures shown will be wrong. Set INVOICE_STATUS_CODES to     *');
-      console.warn('  *  the approved status code(s) for this tenant before demoing.  *');
-      console.warn('  ****************************************************************');
-      console.warn('');
-    }
   });
 })().catch((err) => {
   refuseToStart([
