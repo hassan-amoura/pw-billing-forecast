@@ -66,7 +66,7 @@ npm start               # http://localhost:3000
 | `PW_AUTH_HEADER_NAME` / `PW_AUTH_HEADER_VALUE` | Required when `AUTH_MODE=header`. |
 | `ALLOW_WRITES` | All edits — Projectworks forecasts and app-side supplier lines alike — are blocked unless this is exactly `true`. |
 | `DATABASE_URL` | Required Postgres connection string. The app has no JSON fallback and refuses to boot if the database is unreachable. |
-| `DATABASE_SSL_MODE` | Required: `verify-full` for production TLS with certificate verification, `require` only for a provider without a verifiable certificate, or `disable` for a trusted local connection. |
+| `DATABASE_SSL_MODE` | Required: `require` for Render's internal Postgres URL (its internal TLS certificate is self-signed), `verify-full` for providers with a trusted certificate, or `disable` only for a trusted local connection. |
 | `INSTANCE_ID` | Required stable deployment/tenant identifier. Every app-side read and write is scoped to it. |
 | `AUDIT_RETENTION_LIMIT` | Optional positive integer. Unset means unlimited. When set, excess old entries are removed at boot; audit append never truncates. |
 | `SEED_DEMO_DATA` | Optional, default off. When exactly `true`, a brand-new, empty app-side dataset for this `INSTANCE_ID` is filled from `seed.json`. Never set it on a customer deployment. |

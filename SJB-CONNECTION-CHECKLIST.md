@@ -14,6 +14,7 @@ the Render Blueprint from `render.yaml`.
 - `PW_TENANT_LOCK`: exact unique SJB office name returned on project records.
 - `PW_APP_BASE_URL`: exact SJB Projectworks browser URL.
 - `DATABASE_URL`: backed-up production Postgres connection string.
+- `DATABASE_SSL_MODE`: `require` when using Render's internal Postgres URL.
 - `INSTANCE_ID`: a new stable SJB-only value, such as `sjb-production`.
 - `INVOICE_STATUS_CODES`: SJB statuses that represent approved invoice actuals.
 - `EXPENSE_STATUS_CODES`: SJB status IDs that represent approved expense actuals.

@@ -19,7 +19,7 @@ services:
       - key: SEED_DEMO_DATA
         value: "false"
       - key: DATABASE_SSL_MODE
-        value: verify-full
+        value: require
       - key: PW_REQUEST_TIMEOUT_MS
         value: "30000"
       - key: MODULE_CUSTOM_FIELD_LABELS
