@@ -24,6 +24,31 @@ function normalizedLabel(value) {
   return String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+/** Compare configured and API-returned office names as exact normalized sets. */
+function compareTenantOfficeNames(expectedNames, actualNames) {
+  const uniqueByNormalizedName = (values) => {
+    const names = new Map();
+    for (const value of values) {
+      const display = String(value ?? '').trim().replace(/\s+/g, ' ');
+      const normalized = normalizedLabel(display);
+      if (normalized && !names.has(normalized)) names.set(normalized, display);
+    }
+    return names;
+  };
+
+  const expected = uniqueByNormalizedName(expectedNames);
+  const actual = uniqueByNormalizedName(actualNames);
+  const missing = [...expected.keys()].filter((name) => !actual.has(name)).map((name) => expected.get(name));
+  const unexpected = [...actual.keys()].filter((name) => !expected.has(name)).map((name) => actual.get(name));
+
+  return {
+    matches: missing.length === 0 && unexpected.length === 0,
+    matchedNames: [...expected.keys()].map((name) => actual.get(name)).filter(Boolean),
+    missing,
+    unexpected,
+  };
+}
+
 function identityValue(value) {
   if (value === undefined || value === null || String(value).trim() === '') return '';
   return String(value).trim();
@@ -331,6 +356,7 @@ module.exports = {
   aggregateInvoiceFees,
   buildNetRows,
   collectPages,
+  compareTenantOfficeNames,
   firstValue,
   isMonth,
   moduleMonthTotals,

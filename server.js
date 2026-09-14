@@ -54,6 +54,7 @@ const {
   aggregateInvoiceFees,
   buildNetRows,
   collectPages,
+  compareTenantOfficeNames,
   firstValue,
   isMonth,
   moduleMonthTotals,
@@ -63,7 +64,11 @@ const {
 const BASE_URL = (process.env.PW_BASE_URL || '').replace(/\/+$/, '');
 const APP_BASE_URL = (process.env.PW_APP_BASE_URL || '').replace(/\/+$/, '');
 const AUTH_MODE = (process.env.AUTH_MODE || '').toLowerCase();
-const TENANT_LOCK = (process.env.PW_TENANT_LOCK || '').trim();
+const TENANT_LOCK_NAMES = (process.env.PW_TENANT_LOCK || '')
+  .split(',')
+  .map((name) => name.trim().replace(/\s+/g, ' '))
+  .filter(Boolean);
+const TENANT_LOCK = TENANT_LOCK_NAMES.join(', ');
 const ALLOW_WRITES = process.env.ALLOW_WRITES === 'true';
 const STORAGE_CONFIG = readStorageConfig();
 const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
@@ -125,10 +130,10 @@ if (APP_BASE_URL && !isSecureServiceUrl(APP_BASE_URL)) {
 if (!Number.isSafeInteger(PW_REQUEST_TIMEOUT_MS) || PW_REQUEST_TIMEOUT_MS < 1000 || PW_REQUEST_TIMEOUT_MS > 120000) {
   missingConfig.push('PW_REQUEST_TIMEOUT_MS must be an integer from 1000 to 120000.');
 }
-if (!TENANT_LOCK) {
+if (!TENANT_LOCK_NAMES.length) {
   missingConfig.push(
-    'PW_TENANT_LOCK is not set (the expected Projectworks tenant name — the office ' +
-    'name configured in that tenant). Without it the server cannot tell which tenant ' +
+    'PW_TENANT_LOCK is not set (the expected Projectworks tenant identity — one or ' +
+    'more comma-separated office names configured in that tenant). Without it the server cannot tell which tenant ' +
     'the credential belongs to, so it will not start.'
   );
 }
@@ -388,7 +393,7 @@ async function loadModuleCustomFieldDefinitions() {
 // deliberate act.
 const DEFAULT_OFFICE_NAMES = new Set(['my organisation', 'my organization']);
 
-let RESOLVED_TENANT = null; // { name, offices } — set during boot, before listen
+let RESOLVED_TENANT = null; // { name, names, offices } — set during boot, before listen
 
 /** Case- and whitespace-insensitive form used for every tenant comparison. */
 function normalizeTenantName(value) {
@@ -401,15 +406,12 @@ function alphanumeric(value) {
 }
 
 /**
- * The distinct office names this credential can see, sorted. One page of
- * projects is enough to identify the tenant; this is the same GET
- * /api/v1/Projects the grid already calls, with the same paging parameters.
+ * The distinct office names this credential can see, sorted. Every project
+ * page is checked because a multi-organisation tenant may not expose every
+ * office on the first page.
  */
 async function resolveTenantOfficeNames() {
-  const projects = await pwGet('/api/v1/Projects', { page: 1, pageSize: PAGE_SIZE });
-  if (!Array.isArray(projects)) {
-    throw new Error('GET /api/v1/Projects returned a non-array response; check the endpoint shape.');
-  }
+  const projects = await pwGetAll('/api/v1/Projects');
   const names = new Set();
   for (const p of projects) {
     const name = String(firstValue(p, ['OfficeName', 'officeName']) || '').trim();
@@ -419,21 +421,20 @@ async function resolveTenantOfficeNames() {
 }
 
 /**
- * Resolve the tenant and compare it to PW_TENANT_LOCK. Fails closed: every
- * path that does not end in a confirmed match stops the server. Returns
- * { name, offices } on success.
+ * Resolve the tenant and compare its exact office-name set to PW_TENANT_LOCK.
+ * Fails closed: every path that does not end in a confirmed match stops the
+ * server. Returns { name, names, offices } on success.
  */
 async function enforceTenantLock() {
-  const lockKey = normalizeTenantName(TENANT_LOCK);
-
-  if (DEFAULT_OFFICE_NAMES.has(lockKey)) {
+  const defaultLockName = TENANT_LOCK_NAMES.find((name) => DEFAULT_OFFICE_NAMES.has(normalizeTenantName(name)));
+  if (defaultLockName) {
     refuseToStart([
-      `PW_TENANT_LOCK is set to "${TENANT_LOCK}", which is the default office name`,
+      `PW_TENANT_LOCK includes "${defaultLockName}", which is the default office name`,
       'Projectworks gives every new tenant. It identifies nothing: any other',
       'sandbox whose office has not been renamed would satisfy this lock too.',
       '',
       'Give this tenant a distinctive office name in Projectworks',
-      '(Settings → Offices), then set PW_TENANT_LOCK to that name.',
+      '(Settings → Offices), then list the exact office name(s) in PW_TENANT_LOCK.',
     ]);
   }
 
@@ -477,13 +478,15 @@ async function enforceTenantLock() {
     ]);
   }
 
-  const match = offices.find((name) => normalizeTenantName(name) === lockKey);
-  if (!match) {
+  const comparison = compareTenantOfficeNames(TENANT_LOCK_NAMES, offices);
+  if (!comparison.matches) {
     refuseToStart([
-      'TENANT MISMATCH — this credential is not for the expected tenant.',
+      'TENANT MISMATCH — the credential did not return the exact expected office set.',
       '',
       `  Expected (PW_TENANT_LOCK): "${TENANT_LOCK}"`,
       `  Actual (from the API):     "${offices.join('", "')}"`,
+      ...(comparison.missing.length ? [`  Missing expected office(s):  "${comparison.missing.join('", "')}"`] : []),
+      ...(comparison.unexpected.length ? [`  Unexpected office(s):       "${comparison.unexpected.join('", "')}"`] : []),
       '',
       `  API host: ${new URL(BASE_URL).host} (identical for every tenant, so it`,
       '            proves nothing on its own)',
@@ -491,11 +494,15 @@ async function enforceTenantLock() {
       'The credential in PW_USERNAME / PW_PASSWORD or PW_AUTH_HEADER_VALUE',
       'belongs to a different tenant than the one this deployment is locked to.',
       'Either fix the credential, or — if re-pointing at this tenant is',
-      'intended — update PW_TENANT_LOCK to the actual tenant name.',
+      'intended — update PW_TENANT_LOCK to the complete comma-separated office list.',
     ]);
   }
 
-  return { name: match, offices };
+  return {
+    name: comparison.matchedNames.join(' + '),
+    names: comparison.matchedNames,
+    offices,
+  };
 }
 
 /**
@@ -504,7 +511,7 @@ async function enforceTenantLock() {
  * every link in the UI points at a different tenant than the numbers. Warned
  * about loudly rather than fatal — the links are cosmetic, the data is not.
  */
-function appBaseUrlTenantWarning(tenantName) {
+function appBaseUrlTenantWarning(tenantNames) {
   if (!APP_BASE_URL) return null;
 
   let host;
@@ -516,13 +523,14 @@ function appBaseUrlTenantWarning(tenantName) {
 
   const subdomain = host.split('.')[0] || '';
   const sub = alphanumeric(subdomain);
-  const tenant = alphanumeric(tenantName);
-  if (!sub || !tenant || sub.includes(tenant) || tenant.includes(sub)) return null;
+  const names = Array.isArray(tenantNames) ? tenantNames : [tenantNames];
+  const tenants = names.map(alphanumeric).filter(Boolean);
+  if (!sub || !tenants.length || tenants.some((tenant) => sub.includes(tenant) || tenant.includes(sub))) return null;
 
   return [
     'PW_APP_BASE_URL does not match the resolved tenant.',
     '',
-    `  Resolved tenant: ${tenantName}`,
+    `  Resolved tenant: ${names.join(' + ')}`,
     `  Deep-link host:  ${host}  (subdomain "${subdomain}")`,
     '',
     'Deep links from the grid open a DIFFERENT tenant than the data shown.',
@@ -1016,6 +1024,7 @@ app.get('/api/health', (_req, res) => {
     // Resolved from the API at boot and matched against PW_TENANT_LOCK, so the
     // header chip names the tenant instead of the host every tenant shares.
     tenant: RESOLVED_TENANT ? RESOLVED_TENANT.name : '',
+    tenantNames: RESOLVED_TENANT ? RESOLVED_TENANT.names : [],
     tenantOffices: RESOLVED_TENANT ? RESOLVED_TENANT.offices : [],
     authMode: AUTH_MODE,
     writesEnabled: ALLOW_WRITES,
@@ -1279,7 +1288,7 @@ app.get('/api/audit', async (_req, res) => {
 (async () => {
   RESOLVED_TENANT = await enforceTenantLock();
   const storageStatus = await storage.initialize({ seedDemoData: SEED_DEMO_DATA, seedPath: SEED_PATH });
-  const appBaseWarning = appBaseUrlTenantWarning(RESOLVED_TENANT.name);
+  const appBaseWarning = appBaseUrlTenantWarning(RESOLVED_TENANT.names);
 
   app.listen(PORT, HOST, () => {
     console.log(`pw-billing-forecast listening on ${HOST}:${PORT}`);

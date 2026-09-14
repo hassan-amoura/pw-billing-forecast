@@ -60,7 +60,7 @@ npm start               # http://localhost:3000
 | `AUTH_DISABLED` | Local development only. Exactly `true` removes the gate entirely and logs a boot warning. |
 | `PW_BASE_URL` | API base URL. Point at the STAGE tenant for demos. Required. |
 | `PW_REQUEST_TIMEOUT_MS` | Required bounded timeout for every Projectworks request. Valid range: 1000–120000 ms. |
-| `PW_TENANT_LOCK` | Required. The expected tenant, as its **office name** in Projectworks. On boot the server resolves the office name from `GET /api/v1/Projects` and refuses to start unless it matches — so re-pointing this deployment at a new sandbox is a deliberate act, not something a swapped credential does silently. The default name `My Organisation` is rejected; give each sandbox a unique office name first. |
+| `PW_TENANT_LOCK` | Required. The expected tenant, as its **office name(s)** on Projectworks project records. Use a comma-separated list for a multi-organisation tenant, for example `SJB MEL,SJB SYD`. On boot the server pages through `GET /api/v1/Projects` and refuses to start unless the complete observed office-name set matches. The default name `My Organisation` is rejected. |
 | `AUTH_MODE` | `basic` or `header` — match how you already call the Open API. Required. |
 | `PW_USERNAME` / `PW_PASSWORD` | Required when `AUTH_MODE=basic`. |
 | `PW_AUTH_HEADER_NAME` / `PW_AUTH_HEADER_VALUE` | Required when `AUTH_MODE=header`. |
@@ -131,7 +131,8 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
 1. The tenant is the one you expect. The header chip names the resolved
    tenant (the API host is in its tooltip and in the status bar, because
    that host is the same for every tenant including production). The server
-   will not start at all unless the tenant matches `PW_TENANT_LOCK`.
+   will not start at all unless its complete office-name set matches
+   `PW_TENANT_LOCK`.
 2. `INVOICE_STATUS_CODES` and `EXPENSE_STATUS_CODES` are set to the tenant's
    approved statuses. The server refuses to start without both. The grid
    reports `invoiceStatusesSeen` and `expenseStatusesSeen` for reconciliation.

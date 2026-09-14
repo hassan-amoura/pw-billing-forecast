@@ -8,9 +8,24 @@ const {
   aggregateInvoiceFees,
   buildNetRows,
   collectPages,
+  compareTenantOfficeNames,
   moduleMonthTotals,
   resolveModuleCustomFields,
 } = require('../app-logic');
+
+test('tenant office lock requires the complete office set regardless of case or order', () => {
+  const exact = compareTenantOfficeNames(
+    ['SJB MEL', 'SJB SYD'],
+    ['sjb syd', '  SJB   MEL  ']
+  );
+  const incomplete = compareTenantOfficeNames(['SJB MEL', 'SJB SYD'], ['SJB MEL']);
+  const extra = compareTenantOfficeNames(['SJB MEL', 'SJB SYD'], ['SJB MEL', 'SJB SYD', 'Other']);
+
+  assert.equal(exact.matches, true);
+  assert.deepEqual(exact.matchedNames, ['SJB MEL', 'sjb syd']);
+  assert.deepEqual(incomplete.missing, ['SJB SYD']);
+  assert.deepEqual(extra.unexpected, ['Other']);
+});
 
 const configuredFields = [
   { key: 'stageNumber', label: 'Stage Number' },
