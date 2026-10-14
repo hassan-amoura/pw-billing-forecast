@@ -240,8 +240,11 @@ function requireBasicAuth(req, res, next) {
 // retained solely as the source for the one-time migration.
 
 // ---- Projectworks proxy ----------------------------------------------------
-const PAGE_SIZE = 200;
-const MAX_PAGES = 100; // hard stop: 20,000 records per collection
+// 1000 is the largest page the Open API honours and is required, not merely
+// faster: a copy-of-live tenant returns ~30,000 Modules, which overran the
+// previous 200 x 100 = 20,000 ceiling and failed every grid load outright.
+const PAGE_SIZE = 1000;
+const MAX_PAGES = 100; // hard stop: 100,000 records per collection
 const USER_PAGE_SIZE = 500;
 const USER_CACHE_MS = 5 * 60 * 1000;
 let usersCache = { at: 0, users: [], byID: new Map() };

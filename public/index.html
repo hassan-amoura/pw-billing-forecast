@@ -373,6 +373,7 @@
 </div>
 <div class="notice hidden" id="notice-expense"></div>
 <div class="notice hidden" id="notice-custom-fields"></div>
+<div class="notice hidden" id="notice-rowcap"></div>
 
 <div class="gridwrap" id="gridwrap">
   <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks.</div>
@@ -468,6 +469,12 @@
     draggingColKey: null,
     suppressHeaderClick: false,
   };
+  // A copy-of-live tenant returns tens of thousands of stages. Each rendered
+  // row carries a live <input> per month cell plus its own listeners, so
+  // building the whole set hangs the tab. The DOM is capped; footer totals
+  // and the CSV export still cover every filtered row.
+  const MAX_RENDER_ROWS = 500;
+
   const SELECTED_USER_KEY = 'pw-billing-forecast-selected-user';
   const COLUMN_ORDER_KEY = 'pw-billing-forecast-column-order';
   const COLUMN_METADATA_KEY = 'pw-billing-forecast-column-metadata';
@@ -1308,13 +1315,30 @@
     return `<td ${cellAttrs(col, [label ? 'txt' : '', ...toneClasses(value)])}>${inner}</td>`;
   }
 
+  function rowCountLabel(total, shown, noun) {
+    return total === shown ? `${total} ${noun}` : `${shown} of ${total} ${noun} shown`;
+  }
+
+  function paintRowCapNotice(hidden, noun) {
+    const el = $('notice-rowcap');
+    el.classList.toggle('hidden', hidden <= 0);
+    if (hidden > 0) {
+      el.textContent =
+        `Showing the first ${MAX_RENDER_ROWS} ${noun}; ${hidden} more match the current filters ` +
+        `and are not displayed. Totals and CSV export still cover every matching row — ` +
+        `narrow the filters to bring the rest into view.`;
+    }
+  }
+
   function render() {
     if (!state.loaded || state.tab === 'audit') return;
     const isNet = state.tab === 'net';
     const cols = currentColumns();
     const filteredRows = isNet ? visibleNetRows() : visibleRows();
-    const rows = sortedRows(filteredRows, cols);
+    const sortedAll = sortedRows(filteredRows, cols);
+    const rows = sortedAll.slice(0, MAX_RENDER_ROWS);
     state.viewRows = rows;
+    paintRowCapNotice(sortedAll.length - rows.length, isNet ? 'projects' : 'stages');
 
     // tab counts (unfiltered by tab, filtered by everything else)
     const base = state.rows.filter(r =>
@@ -1350,7 +1374,7 @@
       $('foot').innerHTML = cols.map(col => renderFooterCell(col, filteredRows)).join('');
       $('grid').classList.remove('hidden');
       $('empty').classList.add('hidden');
-      $('s-rows').textContent = filteredRows.length + ' projects';
+      $('s-rows').textContent = rowCountLabel(filteredRows.length, rows.length, 'projects');
       return;
     }
 
@@ -1394,7 +1418,7 @@
 
     $('grid').classList.remove('hidden');
     $('empty').classList.add('hidden');
-    $('s-rows').textContent = filteredRows.length + ' rows';
+    $('s-rows').textContent = rowCountLabel(filteredRows.length, rows.length, 'rows');
   }
 
   async function commitCell(inp, rows) {

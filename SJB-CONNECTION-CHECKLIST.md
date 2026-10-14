@@ -66,3 +66,101 @@ Consultant **Fees to Date** is the cumulative approved, non-planned,
 `amountWithoutTax` expense total linked to that module, dated through today.
 Consultant month cells remain future planning by supplier in this app. They are not
 replaced by expense actuals and are never written to Projectworks.
+
+---
+
+# SJB sandbox (sjb-sandbox.projectworksapp.com)
+
+Verified against the tenant on 2026-10-13 with a read-only sandbox API account.
+This is the copy-of-live environment used for training while the v2 test
+migration runs. Everything below was observed, not assumed.
+
+## Values confirmed against the tenant
+
+| Variable | Value |
+|---|---|
+| `PW_BASE_URL` | `https://api.projectworksapp.com` (unchanged — one host serves every tenant) |
+| `PW_APP_BASE_URL` | `https://sjb-sandbox.projectworksapp.com` |
+| `PW_TENANT_LOCK` | `SJB MEL,SJB SYD` |
+| `INSTANCE_ID` | `sjb-sandbox` (must differ from the production instance — it scopes every Postgres row) |
+| `INVOICE_STATUS_CODES` | `Finance Approved` (13,486 of 13,492 invoices; the other 6 are Draft) |
+| `EXPENSE_STATUS_CODES` | `4` (all 13,297 claims; all non-planned, all module-linked) |
+| `MODULE_CUSTOM_FIELD_LABELS` | `Stage No,Risk Status,Des / Del` — **not** the blueprint default |
+| `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` | **leave unset** — see below |
+
+## Collection sizes and why PAGE_SIZE changed
+
+| Collection | Records |
+|---|---|
+| Projects | 3,664 |
+| Modules | 29,582 |
+| Invoices | 13,492 |
+| ExpenseClaims | 13,297 |
+| Forecasts (12-month window) | 6 |
+
+Modules overran the previous 200 × 100 = 20,000 ceiling, and `collectPages`
+throws rather than truncating, so every grid load failed outright. `PAGE_SIZE`
+is now 1000 (the largest page the API honours), lifting the ceiling to 100,000
+and cutting round trips fivefold. Invoices and ExpenseClaims are all-time pulls
+with no start date, so they only grow — the extra headroom matters for them too.
+
+A full grid load takes 25–45 seconds and returns ~18 MB. Confirm the hosting
+platform's request timeout tolerates that before relying on it.
+
+## Row cap in the grid
+
+26,686 Gross stages cannot all be rendered: each row carries a live `<input>`
+per month cell, so the full set would mean ~320,000 inputs and a hung tab. The
+grid now renders at most `MAX_RENDER_ROWS` (500) and shows a notice naming how
+many are hidden. Footer totals and CSV export still cover every filtered row —
+verified: the footer reported 26,686 stages and A$537,026,372.80, matching a
+direct sum of the API response exactly.
+
+Training sessions should filter by project manager or search before working.
+
+## Custom fields: do not set the entity-type override
+
+Projectworks has no entity type named `Module` in this tenant. Module-level
+custom fields live under **`Project Budget` (EntityTypeID 4)**, and only three
+exist: `Stage No`, `Risk Status`, `Des / Del`.
+
+Setting `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID=4` makes it worse, not better: that
+switches the resolver to ordinal (positional) mapping, which silently
+mis-assigns values — Risk Status is not returned on module records, so the
+column picks up whichever field sits in that position. Observed: Stage No values
+appearing under Risk Status. **Leave the override unset.** Label matching then
+works correctly (`customFieldMapping: identity`).
+
+Resulting state, which is correct and honest:
+
+- **Stage No** — populates, 21,903 of 29,582 rows, 896 distinct legacy values
+  (`999`, `1`–`9`, `11.01`–`11.05`, …)
+- **Risk Status** — defined on Project Budget but never returned on module
+  records; column stays blank and the app names it in `missingCustomFields`
+- **Des / Del** — exists (Design/Delivery) but unpopulated on every module
+  sampled. It is *not* an equivalent of "Fixed / Hourly", which does not exist
+  in this tenant at all
+
+The blueprint default `Stage Number,Risk Status,Fixed / Hourly` matches none of
+these. Two of the three labels are wrong.
+
+## Open items
+
+1. **The tenant lock cannot tell this sandbox from production.** It matches on
+   office name, and the copy carries the same `SJB MEL` / `SJB SYD` names. A
+   production credential pasted into the sandbox service boots clean with no
+   warning. Rename the sandbox offices to something unique to restore the
+   protection; this also clears the `PW_APP_BASE_URL` subdomain warning, which
+   currently fires as a false positive on every boot.
+2. **Six forecast entries exist in the next twelve months.** The grid's month
+   columns are effectively empty. Confirm whether forecasts were meant to come
+   across in the migration, or whether trainees enter them during the session.
+3. **20 consultant expense actuals are excluded** for a missing or mismatched
+   currency, stage link, date or pre-tax amount. Step 2 of the acceptance list
+   requires this to be zero, so it needs investigating before Consultant Fees to
+   Date is presented as accurate.
+4. **The custom-field labels are likely wrong in production too.** `render.yaml`
+   hardcodes the blueprint default, and the sandbox is a copy of live — so the
+   live deployment is probably showing blank Stage Number and Fixed / Hourly
+   columns for the same reason. Worth checking the production service's
+   environment.
