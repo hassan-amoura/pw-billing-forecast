@@ -1,6 +1,8 @@
 # Secrets — every credential lives in the environment, never in the repo.
+# .env.example is the only tracked member of this family.
 .env
-.env.local
+.env.*
+!.env.example
 
 # Legacy flat-file data, retained only as an optional one-time migration input.
 # Postgres is the runtime system of record. seed.json is tracked demo data and is
