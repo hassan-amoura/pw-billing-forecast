@@ -35,6 +35,12 @@ test.describe('ALLOW_WRITES=true', () => {
     await expect(entry).toContainText('forecast.set');
     await expect(entry).toContainText('Alpha Tower');
     await expect(entry).toContainText('Projectworks ✓');
+
+    // The served snapshot was patched: reopening the page, with no refresh,
+    // shows the written value rather than the one read before the edit.
+    await page.reload();
+    await search(page, 'Alpha Tower');
+    await expect(moduleRow(page, named.alphaA).locator(`input[data-month="${named.forecastMonth}"]`)).toHaveValue('4500');
   });
 
   test('consultant (non-services) modules are never written to Projectworks', async ({ page, request }) => {

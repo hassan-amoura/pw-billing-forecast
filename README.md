@@ -193,14 +193,21 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   `pageSize` at 1000 and reports `x-total-count` / `x-page-count` computed on
   the size it actually served. `pw-client.js` reads the page count from those
   headers (never stopping on a merely short page), fetches six pages at a
-  time, de-duplicates by ID and compares the result with `x-total-count`. No
-  sort parameter is sent (none is verified to exist), so records can shift
-  between pages mid-read — production saw 128 duplicated and 128 missing of
-  27,779. A short set is topped up by re-reading the pages around each
-  duplicate (two rounds), then by one sequential pass; if still short the
-  whole read is retried once, and only then logged as `DATA INCOMPLETE` and
-  shown in the UI as a red banner. The tenant lock and the write guard refuse
-  outright.
+  time, de-duplicates by ID and compares the result with `x-total-count`.
+- **Module order is unstable, so stages are reconciled per project.** The API
+  sorts modules by `ModuleName` with nothing to break ties, and honours no
+  sort or keyset parameter (`OrderBy`, `SortBy`, `Sort`, `$orderby`,
+  `AfterModuleID`, … — all tested live, all ignored). Offset pages therefore
+  overlap and gap differently on every read: ~120 of 27,779 come back
+  duplicated and as many never arrive, and re-reading pages only reshuffles
+  them. Each page is read once. Every project record lists its module IDs
+  (`Projects[].Modules`, an exact match for `/Modules`), so the gap is known
+  exactly: only **non-archived** projects with a listed module missing are
+  re-read with `/Modules?ProjectID=` (on SJB typically ~5 projects, ~2 s).
+  Gaps on archived projects are a log line. The red **DATA INCOMPLETE**
+  banner appears only for stages still missing on an active project after
+  that, or for a short invoice / expense / forecast read. The tenant lock and
+  the write guard refuse outright.
   The old build stopped at 200 × 100 = 20,000 modules with only a log line —
   that is where the "20000 stages" footer came from.
 - **Archived projects never reach the browser.** `/api/grid` drops projects
@@ -209,10 +216,25 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   `includeArchived=1`. On SJB this takes the grid from ~27,800 stages to ~5,900.
 - **Organisation filter.** The Organisation select (All / SJB MEL / SJB SYD)
   is built from `GET /api/v1/Offices` and applied server-side by `OfficeID`.
-- **Caching.** Offices, custom-field definitions and projects are cached (10
-  and 5 minutes). Modules, invoices, forecasts and expense claims are held for
-  60 seconds so that changing a filter does not re-read ~60,000 records;
-  **Load data** always re-reads them, and a forecast write clears the cache.
+- **Snapshots: the grid opens instantly.** The last complete read of every
+  source is kept per forecast window, in memory and gzipped in Postgres
+  (`grid_snapshots`), so it survives restarts and deploys. Opening the page
+  serves it straight away, with **Last refreshed hh:mm** in the status line.
+  **Load data** refreshes in the background (`POST /api/grid/refresh`) with a
+  progress bar; the previous data stays on screen until the new snapshot is
+  swapped in. Filters rebuild rows from the snapshot without reading
+  Projectworks. A forecast write is patched into every snapshot that shows it
+  (and into a refresh in flight); supplier lines are read live from Postgres.
+  Offices and custom-field definitions are cached for 10 minutes.
+- **Per-phase timings are logged on every refresh**, e.g. `grid refresh
+  2026-10..2027-09 in 9.8s: projects 4.4s (3,685) · reference 1.3s · modules
+  7.6s (27,655 of 27,779, 124 duplicate(s)) · reconcile 2.1s (5 active
+  project(s) re-read, 7 stage(s) recovered) · invoices …`, and every grid
+  build logs its row counts and build time.
+- **No full read at boot.** Boot reads only `/Projects` (the tenant lock).
+  The custom-field and invoice-status diagnostics are logged after the first
+  refresh from its data; `STARTUP_DIAGNOSTICS=true` restores the old full
+  Modules + Invoices read at boot (3.5–4 minutes on Render).
 - **Supplier-line writes are checked server-side.** A supplier line cannot be
   added to or edited against a services module even if a caller bypasses the UI.
 - **Stale edits fail visibly.** Gross writes compare the grid's prior value
@@ -249,11 +271,12 @@ chromium` once if Chromium 1179 is not already cached.
 | Spec | Covers |
 |---|---|
 | `auth.spec.ts` | Basic auth gate: 401 without or with wrong credentials, `/healthz` open, app opens with valid credentials |
-| `pagination.spec.ts` | Records shifting between pages mid-read (128 duplicated / 128 missing, as in production) are deduplicated and re-fetched with no banner; a shift that never settles still shows DATA INCOMPLETE |
+| `pagination.spec.ts` | A production-sized persistent page shift, and page order reshuffled on **every** request, both end with every active stage and no banner, each page read once; an active stage no read returns raises DATA INCOMPLETE naming its project; an archived-only gap is not a banner |
+| `snapshot.spec.ts` | Reopening the page shows the last snapshot without Load data, with "Last refreshed"; Load data shows progress while the old grid stays usable; a restarted server serves the snapshot from Postgres |
 | `filters.spec.ts` | No truncation (footer count = fixture active total); 500-row cap shown as a neutral status-line note; archived hidden by default, toggle shows them; organisation All / SJB MEL / SJB SYD |
 | `stage-no.spec.ts` | Stage No populated from the custom field and blank when unset; headers use the configured labels |
 | `status-filters.spec.ts` | Gross Fees to Date counts only Finance Approved invoices; Consultant Fees to Date only Approved (ID 4) claims |
-| `writes.spec.ts` | `ALLOW_WRITES=true`: cells editable, an edit sends `{ moduleID, date: "YYYY-MM-01", amount, comment }` to `POST /Forecasts/Set` and is audited; consultant modules are refused |
+| `writes.spec.ts` | `ALLOW_WRITES=true`: cells editable, an edit sends `{ moduleID, date: "YYYY-MM-01", amount, comment }` to `POST /Forecasts/Set`, is audited, and is patched into the served snapshot; consultant modules are refused |
 | `readonly.spec.ts` | `ALLOW_WRITES=false`: cells disabled, `/api/forecast` returns 403, nothing reaches the mock |
 | `tenant-lock.spec.ts` | A mismatched `PW_TENANT_LOCK` refuses to start; `SJB SYD` alone refuses a tenant that also has `SJB MEL` projects |
 

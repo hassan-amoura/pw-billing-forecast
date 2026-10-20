@@ -219,6 +219,18 @@ function createStorage(config) {
       CREATE INDEX IF NOT EXISTS audit_log_instance_time_idx
       ON audit_log (instance_id, time DESC, id DESC)
     `);
+    // The last complete set of grid sources per forecast window, gzipped JSON.
+    // A cache: always safe to delete, rebuilt by the next refresh.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS grid_snapshots (
+        instance_id TEXT NOT NULL,
+        window_key TEXT NOT NULL,
+        fetched_at TIMESTAMPTZ NOT NULL,
+        payload BYTEA NOT NULL,
+        saved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (instance_id, window_key)
+      )
+    `);
   }
 
   async function resetSupplierLineSequence(client, minimumNextID = 1) {
@@ -665,9 +677,60 @@ function createStorage(config) {
     }
   }
 
+  /**
+   * Upsert one window's snapshot. A save never replaces a snapshot fetched
+   * later than its own, so a slow save cannot roll back a newer refresh.
+   * Only the newest `keep` windows are retained.
+   */
+  async function saveGridSnapshot(windowKey, fetchedAt, payload, keep = 6) {
+    await pool.query(
+      `INSERT INTO grid_snapshots (instance_id, window_key, fetched_at, payload)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (instance_id, window_key) DO UPDATE
+         SET fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload, saved_at = now()
+         WHERE grid_snapshots.fetched_at <= EXCLUDED.fetched_at`,
+      [config.instanceId, String(windowKey), isoTime(fetchedAt, 'snapshot fetched_at'), payload]
+    );
+    await pool.query(
+      `DELETE FROM grid_snapshots
+       WHERE instance_id = $1 AND window_key NOT IN (
+         SELECT window_key FROM grid_snapshots WHERE instance_id = $1
+         ORDER BY fetched_at DESC LIMIT $2)`,
+      [config.instanceId, keep]
+    );
+  }
+
+  /** { fetchedAt, payload } for one window, or null. */
+  async function loadGridSnapshot(windowKey) {
+    const result = await pool.query(
+      'SELECT fetched_at, payload FROM grid_snapshots WHERE instance_id = $1 AND window_key = $2',
+      [config.instanceId, String(windowKey)]
+    );
+    if (!result.rowCount) return null;
+    return { fetchedAt: isoTime(result.rows[0].fetched_at, 'snapshot fetched_at'), payload: result.rows[0].payload };
+  }
+
+  async function deleteGridSnapshot(windowKey) {
+    await pool.query('DELETE FROM grid_snapshots WHERE instance_id = $1 AND window_key = $2',
+      [config.instanceId, String(windowKey)]);
+  }
+
+  /** Window keys with a stored snapshot, newest first. */
+  async function listGridSnapshots() {
+    const result = await pool.query(
+      'SELECT window_key FROM grid_snapshots WHERE instance_id = $1 ORDER BY fetched_at DESC',
+      [config.instanceId]
+    );
+    return result.rows.map((row) => row.window_key);
+  }
+
   return {
     initialize,
     ping,
+    saveGridSnapshot,
+    loadGridSnapshot,
+    deleteGridSnapshot,
+    listGridSnapshots,
     getSupplierLines,
     getAudit,
     transaction,

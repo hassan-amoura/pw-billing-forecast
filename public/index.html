@@ -250,6 +250,10 @@
     font-family:var(--mono);font-size:11px;color:var(--muted);
     padding:7px 20px;border-top:1px solid var(--line);background:#fff;
   }
+  .refresh-progress{display:inline-flex;align-items:center;gap:8px;color:var(--navy)}
+  .refresh-progress .bar{width:120px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+  .refresh-progress .fill{display:block;height:100%;width:0;background:var(--lime);transition:width .3s ease}
+  .refresh-progress.hidden{display:none}
 
   /* ---- Projectworks user picker in the brand band ---- */
   .who{display:flex;align-items:center;gap:7px}
@@ -387,7 +391,7 @@
 <div class="notice hidden" id="notice-expense"></div>
 
 <div class="gridwrap" id="gridwrap">
-  <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks.</div>
+  <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks. Once loaded, the latest data opens instantly.</div>
   <table id="grid" class="hidden" data-testid="grid">
     <thead><tr id="head"></tr></thead>
     <tbody id="body"></tbody>
@@ -411,7 +415,12 @@
 <div class="statusline">
   <span id="s-rows" data-testid="row-count">0 rows</span>
   <span id="s-meta" data-testid="load-meta"></span>
+  <span class="refresh-progress hidden" id="s-progress" data-testid="refresh-progress" role="status" aria-live="polite">
+    <span class="bar"><span class="fill" id="s-progress-fill"></span></span>
+    <span id="s-progress-text"></span>
+  </span>
   <span class="spacer"></span>
+  <span id="s-refreshed" data-testid="last-refreshed"></span>
   <span id="s-host"></span>
 </div>
 
@@ -471,6 +480,8 @@
     defaultCurrency: '',
     customFieldLabels: ['Stage Number', 'Risk Status', 'Fixed / Hourly'], // MODULE_CUSTOM_FIELD_LABELS
     loadSeq: 0,       // ignores a slower, superseded /api/grid response
+    loading: 0,       // /api/grid requests in flight
+    refreshing: false, // a "Load data" background refresh is running
     sort: { key: null, dir: null }, // dir: 'asc', 'desc', or null
     cols: [],       // ordered column defs for the current render
     viewRows: [],   // filtered rows backing the current tbody (data-row indexes point here)
@@ -732,6 +743,8 @@
   });
 
   initOffices();
+  // The server's last snapshot, if any: the grid is on screen before anyone presses Load data.
+  load({ ifCached: true });
 
   /** Organisations come from GET /api/v1/Offices via the server, never a hardcoded list. */
   async function initOffices() {
@@ -817,25 +830,48 @@
 
   // ---- load ----------------------------------------------------------
   /**
-   * Archived projects and the organisation filter are applied on the server,
-   * so changing either re-queries. "Load data" asks for fresh=1; a filter
-   * change reuses the server's one-minute source cache.
+   * The server keeps the last complete snapshot of every Projectworks source,
+   * so the grid is built from it in a moment: on page load, and on any change
+   * of the archived or organisation filter (both applied server-side).
+   * "Load data" refreshes the snapshot in the background (refresh()) while the
+   * current one stays on screen, then swaps the new one in.
    */
+  function setLoadButton() {
+    const btn = $('btn-load');
+    btn.disabled = state.refreshing;
+    btn.textContent = state.refreshing ? 'Refreshing…' : (state.loading && !state.loaded ? 'Loading…' : 'Load data');
+  }
+
+  function formatRefreshed(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toDateString() === new Date().toDateString()
+      ? time
+      : `${d.toLocaleDateString([], { day: 'numeric', month: 'short' })} ${time}`;
+  }
+
+  /** opts.ifCached: page load — show the stored snapshot if there is one, never wait on Projectworks. */
   async function load(opts = {}) {
     const start = startPick.value, end = endPick.value;
     if (!start || !end || end < start) { toast('Set a valid forecast range first.', true); return; }
     const seq = ++state.loadSeq;
-    const btn = $('btn-load');
-    btn.disabled = true; btn.textContent = 'Loading…';
+    state.loading += 1;
+    setLoadButton();
     $('grid').setAttribute('aria-busy', 'true');
     const params = new URLSearchParams({ start, end, office: $('f-office').value || 'all' });
     if ($('f-archived').checked) params.set('includeArchived', '1');
-    if (opts.fresh) params.set('fresh', '1');
+    if (opts.ifCached) params.set('ifCached', '1');
     try {
       const r = await fetch(`/api/grid?${params}`);
       const data = await r.json();
       if (seq !== state.loadSeq) return; // a newer request owns the grid
       if (!r.ok) throw new Error(data.error || r.statusText);
+      if (data.snapshot === false) {
+        // Nothing stored for this range yet; Load data reads it.
+        if (data.refresh && data.refresh.status === 'running') refresh();
+        return;
+      }
       $('notice-load-error').classList.add('hidden');
       state.rows = data.rows;
       state.netRows = data.netRows || [];
@@ -854,16 +890,18 @@
         `${count(m.forecastEntries)} forecast entries`;
       $('s-meta').title = `${count(m.modulesTotal)} stages and ${count(m.projectsTotal)} projects in Projectworks, ` +
         `every page fetched and checked against the API's record counts. ` +
-        (m.fromCache ? 'Served from the one-minute server cache.' : `Fetched in ${(m.fetchMs / 1000).toFixed(1)}s.`);
+        `Read from Projectworks in ${(m.fetchMs / 1000).toFixed(1)}s.`;
+      $('s-refreshed').textContent = m.fetchedAt ? `Last refreshed ${formatRefreshed(m.fetchedAt)}` : '';
+      $('s-refreshed').title = m.fetchedAt ? `Projectworks data as of ${new Date(m.fetchedAt).toLocaleString()}. Load data refreshes it.` : '';
       if (Array.isArray(m.offices)) renderOfficeOptions(m.offices);
       applyCustomFieldLabels(m.customFieldLabels);
-      // Fail loudly: a collection that did not match the API's own count.
+      // Fail loudly: stages missing on active projects, or a collection that
+      // did not match the API's own count.
       const integrity = m.integrityErrors || [];
       $('notice-integrity').classList.toggle('hidden', integrity.length === 0);
       $('notice-integrity').innerHTML = integrity.length
         ? '<b>Data is incomplete — do not rely on these totals.</b> ' +
-          'Projectworks reported more records than were received: ' + integrity.map(esc).join(' ') +
-          ' Press Load data to retry.'
+          integrity.map(esc).join(' ') + ' Press Load data to retry.'
         : '';
       const warnings = m.warnings || [];
       $('notice-warnings').classList.toggle('hidden', warnings.length === 0);
@@ -883,18 +921,79 @@
       // matter (logged at startup), not a user-facing banner: the column is
       // simply blank.
       render();
-      toast('Loaded from Projectworks.');
-      tickSync();
+      // Another tab or user may have started a refresh of this range: follow it.
+      if (m.refresh && m.refresh.status === 'running' && !state.refreshing) refresh();
     } catch (e) {
       if (seq !== state.loadSeq) return;
       $('notice-load-error').textContent = 'Load failed: ' + e.message;
       $('notice-load-error').classList.remove('hidden');
       toast('Load failed: ' + e.message, true);
     } finally {
-      if (seq === state.loadSeq) {
-        btn.disabled = false; btn.textContent = 'Load data';
-        $('grid').removeAttribute('aria-busy');
+      state.loading -= 1;
+      if (seq === state.loadSeq) $('grid').removeAttribute('aria-busy');
+      setLoadButton();
+    }
+  }
+
+  const REFRESH_PHASE_LABELS = {
+    projects: 'projects', reference: 'organisations & fields', modules: 'stages', reconcile: 'checking stages',
+    invoices: 'invoices', expenses: 'expenses', forecasts: 'forecasts',
+  };
+
+  function showRefreshProgress(status) {
+    const el = $('s-progress');
+    if (!status) { el.classList.add('hidden'); return; }
+    const phases = Object.entries(status.phases || {});
+    // Each phase is one share of the bar; a paged phase fills its share page by page.
+    const share = (p) => p.status === 'done' ? 1 : (p.pages ? (p.pagesDone || 0) / p.pages : 0);
+    const fraction = phases.length ? phases.reduce((sum, [, p]) => sum + share(p), 0) / phases.length : 0;
+    const active = phases.filter(([, p]) => p.status === 'running')
+      .map(([name, p]) => REFRESH_PHASE_LABELS[name] + (p.pages ? ` ${p.pagesDone || 0}/${p.pages}` : ''));
+    $('s-progress-fill').style.width = `${Math.round(Math.min(1, fraction) * 100)}%`;
+    $('s-progress-text').textContent = `Refreshing from Projectworks… ${active.join(' · ') || 'finishing'}`;
+    el.classList.remove('hidden');
+  }
+
+  /**
+   * "Load data": refresh the server's snapshot in the background, show its
+   * progress, then swap the new data in. The grid on screen stays usable.
+   */
+  async function refresh() {
+    const start = startPick.value, end = endPick.value;
+    if (!start || !end || end < start) { toast('Set a valid forecast range first.', true); return; }
+    if (state.refreshing) return;
+    state.refreshing = true;
+    setLoadButton();
+    const params = new URLSearchParams({ start, end });
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    try {
+      let r = await fetch(`/api/grid/refresh?${params}`, { method: 'POST' });
+      let status = await r.json();
+      if (!r.ok) throw new Error(status.error || r.statusText);
+      while (status.status === 'running') {
+        showRefreshProgress(status);
+        await sleep(500);
+        r = await fetch(`/api/grid/refresh?${params}`);
+        status = await r.json();
+        if (!r.ok) throw new Error(status.error || r.statusText);
       }
+      if (status.status === 'error') throw new Error(status.error || 'refresh failed');
+      showRefreshProgress(null);
+      await load();
+      if ($('notice-load-error').classList.contains('hidden')) {
+        toast('Refreshed from Projectworks.');
+        tickSync();
+      }
+    } catch (e) {
+      // The previous snapshot stays on screen.
+      $('notice-load-error').textContent = 'Refresh failed: ' + e.message +
+        (state.loaded ? ' The grid still shows the previous data.' : '');
+      $('notice-load-error').classList.remove('hidden');
+      toast('Refresh failed: ' + e.message, true);
+    } finally {
+      showRefreshProgress(null);
+      state.refreshing = false;
+      setLoadButton();
     }
   }
 
@@ -1715,7 +1814,7 @@
   }
 
   // ---- events --------------------------------------------------------
-  $('btn-load').addEventListener('click', () => load({ fresh: true }));
+  $('btn-load').addEventListener('click', () => refresh());
   ['f-archived', 'f-office'].forEach(id => $(id).addEventListener('change', () => {
     if (state.loaded) load();
   }));

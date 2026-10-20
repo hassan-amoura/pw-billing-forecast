@@ -13,11 +13,20 @@
  * treated a short page as the last page would truncate at 750 records.
  *
  * Control endpoints (no auth): GET /__mock/health, GET /__mock/forecast-sets,
- * POST /__mock/reset, and POST /__mock/shift?pages=3,7&by=64&times=1, which
- * makes /Modules serve each listed page `by` records early for its next
- * `times` requests (times=always: every request). A shifted page repeats the
- * tail of the page before it and drops as many records from its own end — the
- * duplicate/missing pattern an unstable sort produces under concurrent paging.
+ * POST /__mock/reset, and:
+ *   POST /__mock/shift?pages=3,7&by=64&times=1 — /Modules serves each listed
+ *     page `by` records early for its next `times` requests (times=always:
+ *     every request). A shifted page repeats the tail of the page before it
+ *     and drops as many records from its own end — the duplicate/missing
+ *     pattern an unstable sort produces under concurrent paging.
+ *   POST /__mock/unstable?on=1 — /Modules sorts by ModuleName, as the live API
+ *     does, and breaks the (many) ties at random on EVERY request, so no two
+ *     page reads agree on the order and re-reading pages can never converge.
+ *   POST /__mock/hide?modules=1,2 — those modules are counted in
+ *     x-total-count but never served, by any /Modules query, ProjectID
+ *     included: a gap no re-read can fill.
+ *   POST /__mock/delay?ms=800 — every /Modules response waits this long.
+ *   GET  /__mock/requests — count of /Modules requests by kind since reset.
  */
 
 const http = require('http');
@@ -31,10 +40,18 @@ const PAGE_CAP = 750;
 let data;
 let forecastSets;
 let shift; // Map page -> remaining shifted responses, plus `by`
+let unstable;
+let hidden; // Set of ModuleIDs counted but never served
+let delayMs;
+let requests;
 function reset() {
   data = buildFixtures();
   forecastSets = [];
   shift = { by: 0, pages: new Map() };
+  unstable = false;
+  hidden = new Set();
+  delayMs = 0;
+  requests = { modulesPaged: 0, modulesByProject: 0, modulesByID: 0 };
 }
 reset();
 
@@ -43,7 +60,7 @@ function send(res, status, body, headers = {}) {
   res.end(JSON.stringify(body));
 }
 
-function paginate(res, rows, query, { headers = true, pageSizeParam = true, shifting = false } = {}) {
+function paginate(res, rows, query, { headers = true, pageSizeParam = true, shifting = false, phantom = 0 } = {}) {
   const page = Math.max(1, Number(query.get('page')) || 1);
   const requested = pageSizeParam ? Number(query.get('pageSize')) || 100 : 100;
   const size = Math.min(requested, PAGE_CAP);
@@ -53,8 +70,10 @@ function paginate(res, rows, query, { headers = true, pageSizeParam = true, shif
     shift.pages.set(page, shift.pages.get(page) - 1);
   }
   const body = rows.slice(Math.max(0, (page - 1) * size - offset), page * size - offset);
+  // `phantom` records are counted but never served (see /__mock/hide).
+  const total = rows.length + phantom;
   const extra = headers
-    ? { 'x-total-count': String(rows.length), 'x-page-count': String(Math.ceil(rows.length / size)) }
+    ? { 'x-total-count': String(total), 'x-page-count': String(Math.ceil(total / size)) }
     : {};
   send(res, 200, body, extra);
 }
@@ -72,10 +91,19 @@ function handleGet(res, path, q) {
       const projectID = num(q.get('ProjectID'));
       const moduleID = num(q.get('ModuleID'));
       const withFields = String(q.get('IncludeCustomFields')).toLowerCase() === 'true';
-      const rows = data.modules
-        .filter((m) => (projectID === null || m.ProjectID === projectID) && (moduleID === null || m.ModuleID === moduleID))
-        .map((m) => (withFields ? m : { ...m, CustomFields: [] }));
-      return paginate(res, rows, q, { shifting: true });
+      requests[moduleID !== null ? 'modulesByID' : (projectID !== null ? 'modulesByProject' : 'modulesPaged')] += 1;
+      let rows = data.modules
+        .filter((m) => (projectID === null || m.ProjectID === projectID) && (moduleID === null || m.ModuleID === moduleID));
+      if (unstable) {
+        rows = rows
+          .map((m) => ({ m, tie: Math.random() }))
+          .sort((a, b) => a.m.ModuleName.localeCompare(b.m.ModuleName) || a.tie - b.tie)
+          .map(({ m }) => m);
+      }
+      const served = rows.filter((m) => !hidden.has(m.ModuleID)).map((m) => (withFields ? m : { ...m, CustomFields: [] }));
+      const respond = () => paginate(res, served, q, { shifting: true, phantom: rows.length - served.length });
+      if (delayMs) return void setTimeout(respond, delayMs);
+      return respond();
     }
     case '/api/v1/Invoices':
       return paginate(res, data.invoices, q);
@@ -128,6 +156,19 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/__mock/health') return send(res, 200, { ok: true, expected: data.expected, named: data.named });
   if (url.pathname === '/__mock/forecast-sets') return send(res, 200, forecastSets);
   if (url.pathname === '/__mock/reset' && req.method === 'POST') { reset(); return send(res, 200, { ok: true }); }
+  if (url.pathname === '/__mock/requests') return send(res, 200, requests);
+  if (url.pathname === '/__mock/unstable' && req.method === 'POST') {
+    unstable = url.searchParams.get('on') !== '0';
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/hide' && req.method === 'POST') {
+    hidden = new Set(String(url.searchParams.get('modules') || '').split(',').filter(Boolean).map(Number));
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/delay' && req.method === 'POST') {
+    delayMs = Number(url.searchParams.get('ms')) || 0;
+    return send(res, 200, { ok: true });
+  }
   if (url.pathname === '/__mock/shift' && req.method === 'POST') {
     const q = url.searchParams;
     const times = q.get('times') === 'always' ? Infinity : Number(q.get('times')) || 1;

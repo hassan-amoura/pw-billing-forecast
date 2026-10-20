@@ -437,6 +437,102 @@ function buildNetRows(rows, inWindow) {
   return output;
 }
 
+/**
+ * The module IDs a project record lists. The live /Projects response carries
+ * `Modules` as a plain array of ModuleIDs (verified 2026-10-20: 27,779 across
+ * SJB's 3,685 projects, equal to /Modules' x-total-count), which makes it the
+ * exact expected set per project. Object entries are read for their ModuleID.
+ * Returns null when the record carries no Modules array at all.
+ */
+function projectModuleIDs(project) {
+  const embedded = firstValue(project, ['ModuleIDs', 'Modules', 'modules']);
+  if (!Array.isArray(embedded)) return null;
+  return embedded
+    .map((entry) => (entry && typeof entry === 'object' ? firstValue(entry, ['ModuleID', 'moduleID']) : entry))
+    .filter((id) => id !== undefined && id !== null && id !== '')
+    .map(String);
+}
+
+/**
+ * Make the module set exact for every non-archived project.
+ *
+ * The paged /Modules read is unstable (ties in the API's sort) and comes back
+ * ~120 short on SJB, almost all of it on archived projects. Each project
+ * record lists its module IDs, so the gap is known exactly: only the
+ * non-archived projects with a listed module missing are re-read by ProjectID.
+ * A ProjectID read is a single small page, so it is not exposed to the page
+ * shifting that loses records in the full read.
+ *
+ * A per-project read that completes is authoritative for that project: a
+ * listed ID it does not return was deleted after the project list was read,
+ * and is not reported missing. Gaps on archived projects are counted, never
+ * fetched.
+ *
+ * @param {object} args
+ * @param {object[]} args.projects        project records (with Modules / ModuleIDs)
+ * @param {object[]} args.modules         deduplicated modules from the paged read
+ * @param {(project) => boolean} args.isArchived
+ * @param {(projectID: string) => Promise<{ rows: object[], report: { complete: boolean } }>} args.fetchProjectModules
+ * @returns {Promise<{ modules: object[], detectable: boolean, refetchedProjects: number,
+ *   recovered: number, missingActive: { projectID: string, moduleIDs: string[], error?: string }[],
+ *   missingArchived: number, missingArchivedProjects: number }>}
+ */
+async function reconcileModules({ projects, modules, isArchived, fetchProjectModules }) {
+  const idOf = (m) => String(firstValue(m, ['ModuleID', 'moduleID']));
+  const projectOf = (r) => String(firstValue(r, ['ProjectID', 'projectID']));
+  const byID = new Map(modules.map((m) => [idOf(m), m]));
+  const result = {
+    modules,
+    detectable: false,
+    refetchedProjects: 0,
+    recovered: 0,
+    missingActive: [],
+    missingArchived: 0,
+    missingArchivedProjects: 0,
+  };
+
+  const toFetch = [];
+  for (const project of projects) {
+    const expected = projectModuleIDs(project);
+    if (!expected) continue;
+    result.detectable = true;
+    const missing = expected.filter((id) => !byID.has(id));
+    if (!missing.length) continue;
+    if (isArchived(project)) {
+      result.missingArchived += missing.length;
+      result.missingArchivedProjects += 1;
+    } else {
+      toFetch.push({ projectID: projectOf(project), missing });
+    }
+  }
+  if (!toFetch.length) return result;
+
+  const settled = await Promise.all(toFetch.map(async ({ projectID, missing }) => {
+    try {
+      return { projectID, missing, ...(await fetchProjectModules(projectID)) };
+    } catch (err) {
+      return { projectID, missing, error: String((err && err.message) || err) };
+    }
+  }));
+  result.refetchedProjects = settled.length;
+  for (const { projectID, missing, rows, report, error } of settled) {
+    for (const row of rows || []) {
+      if (projectOf(row) !== projectID) continue; // an ignored filter cannot pass off another project's module
+      const id = idOf(row);
+      if (!byID.has(id)) result.recovered += 1;
+      byID.set(id, row);
+    }
+    const stillMissing = missing.filter((id) => !byID.has(id));
+    if (error || !report || !report.complete) {
+      if (stillMissing.length) {
+        result.missingActive.push({ projectID, moduleIDs: stillMissing, ...(error ? { error } : {}) });
+      }
+    }
+  }
+  result.modules = [...byID.values()];
+  return result;
+}
+
 module.exports = {
   aggregateExpenseActuals,
   aggregateForecasts,
@@ -451,6 +547,8 @@ module.exports = {
   moduleMonthTotals,
   normalizedLabel,
   parseList,
+  projectModuleIDs,
+  reconcileModules,
   resolveExpenseStatusFilter,
   resolveModuleCustomFields,
 };

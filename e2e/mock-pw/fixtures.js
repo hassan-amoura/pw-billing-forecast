@@ -5,9 +5,11 @@
  *
  * Shaped on SJB's live tenant (verified 2026-10-20): two offices, most
  * projects archived through ProjectStatusName "Archived" while IsActive stays
- * true, a few archived through IsActive=false, modules in PascalCase with
- * CustomFields entries carrying Label/FieldID/Value, and invoices/expenses in
- * a mix of statuses. Well over 20,000 modules so any page cap shows up.
+ * true, a few archived through IsActive=false, each project's Modules a plain
+ * array of its ModuleIDs, modules in PascalCase with CustomFields entries
+ * carrying Label/FieldID/Value, module names repeated across projects (the
+ * live API sorts by ModuleName, so ties are the norm), and invoices/expenses
+ * in a mix of statuses. Well over 20,000 modules so any page cap shows up.
  *
  * Named records the specs rely on are listed in NAMED; everything else is
  * generated from a seeded PRNG. `expected` is computed from the same data the
@@ -81,6 +83,7 @@ function buildFixtures() {
       Tasks: [{ TaskID: 1, TaskName: 'Task' }], CustomFields: customFields(fields),
     };
     modules.push(m);
+    p.Modules.push(m.ModuleID);
     return m;
   };
   const invoice = (p, m, statusCode, statusID, amount) => invoices.push({
@@ -113,7 +116,7 @@ function buildFixtures() {
   invoice(bravo, bravoA, 'Finance Approved', 4, 1500);
 
   const zulu = project(3, 'Zulu Archive', OFFICES[0], STATUS.archived, true);
-  module(zulu, 'Stage Z Closed', { budget: 9000, fields: { stageNo: '99.01' } });
+  const zuluZ = module(zulu, 'Stage Z Closed', { budget: 9000, fields: { stageNo: '99.01' } });
 
   const yankee = project(4, 'Yankee Legacy', OFFICES[1], STATUS.signed, false);
   module(yankee, 'Stage Y Old', { budget: 7000, fields: { stageNo: '98.01' } });
@@ -175,7 +178,10 @@ function buildFixtures() {
 
   return {
     offices: OFFICES, projects, modules, invoices, expenseClaims, forecasts, users, expected,
-    named: { alphaA: alphaA.ModuleID, alphaB: alphaB.ModuleID, alphaC: alphaC.ModuleID, bravoA: bravoA.ModuleID, forecastMonth: month(1) },
+    named: {
+      alphaA: alphaA.ModuleID, alphaB: alphaB.ModuleID, alphaC: alphaC.ModuleID, bravoA: bravoA.ModuleID,
+      zuluZ: zuluZ.ModuleID, forecastMonth: month(1),
+    },
   };
 }
 

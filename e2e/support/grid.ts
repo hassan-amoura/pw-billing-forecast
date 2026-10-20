@@ -13,7 +13,7 @@ export interface MockState {
     syd: Counts;
     mel: Counts;
   };
-  named: { alphaA: number; alphaB: number; alphaC: number; bravoA: number; forecastMonth: string };
+  named: { alphaA: number; alphaB: number; alphaC: number; bravoA: number; zuluZ: number; forecastMonth: string };
 }
 
 /** Expected counts and named module IDs, computed by the mock from the data it serves. */
@@ -31,11 +31,33 @@ export async function shiftModulePages(
   expect(res.ok()).toBeTruthy();
 }
 
+/** /Modules sorted by ModuleName with ties reshuffled on every request, like the live API. */
+export async function setUnstableModuleOrder(request: APIRequestContext, on: boolean): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/unstable?on=${on ? 1 : 0}`)).ok()).toBeTruthy();
+}
+
+/** Count these modules in x-total-count but never serve them, by any query. */
+export async function hideModules(request: APIRequestContext, moduleIDs: number[]): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/hide?modules=${moduleIDs.join(',')}`)).ok()).toBeTruthy();
+}
+
+/** Delay every /Modules response, so a refresh stays in flight long enough to watch. */
+export async function delayModules(request: APIRequestContext, ms: number): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/delay?ms=${ms}`)).ok()).toBeTruthy();
+}
+
+export async function moduleRequests(request: APIRequestContext): Promise<{ modulesPaged: number; modulesByProject: number; modulesByID: number }> {
+  return (await request.get(`${MOCK_URL}/__mock/requests`)).json();
+}
+
 export async function resetMock(request: APIRequestContext): Promise<void> {
   expect((await request.post(`${MOCK_URL}/__mock/reset`)).ok()).toBeTruthy();
 }
 
-/** Open the app and press Load data (fresh=1), waiting until the grid is rendered and idle. */
+/**
+ * Open the app and press Load data (a background refresh from Projectworks),
+ * waiting until the refreshed grid is rendered and idle.
+ */
 export async function loadGrid(page: Page): Promise<void> {
   await page.goto('/');
   await page.getByTestId('load-button').click();

@@ -101,36 +101,31 @@ function shiftingApi(all, { cap = 1000, shifted = [], by = 64, times = 1, calls 
   };
 }
 
-test('records that shift between pages are deduplicated and the missing ones re-fetched', async () => {
-  // Two shifted pages × 64 = 128 duplicated and 128 missing, as seen in production.
+test('records that shift between pages are deduplicated and the shortfall reported, with no page re-read', async () => {
+  // Two shifted pages × 64 = 128 duplicated and 128 missing, as seen in
+  // production. Re-reading pages over an unstable order reshuffles again and
+  // cannot converge, so the client reads each page once and says what is short.
   const calls = [];
   const pw = client(shiftingApi(records(27779), { shifted: [3, 7], calls }));
   const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
   assert.equal(report.duplicates, 128);
-  assert.equal(report.unique, 27779);
-  assert.equal(report.complete, true);
-  assert.equal(report.recoveryPasses, 1);
-  assert.equal(rows.length, 27779);
-  assert.equal(new Set(rows.map((r) => r.ModuleID)).size, 27779);
-  // 28 pages, then only the pages around the two shifted boundaries (1–4 and
-  // 5–8) again; no sequential pass.
-  assert.equal(calls.length, 28 + 8);
-});
-
-test('a shift that survives the targeted re-reads is settled by a sequential pass', async () => {
-  const calls = [];
-  const pw = client(shiftingApi(records(5000), { shifted: [3], times: 3, calls }));
-  const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
-  assert.equal(report.complete, true);
-  assert.equal(report.recoveryPasses, 3);
-  assert.equal(rows.length, 5000);
-});
-
-test('a collection still short after recovery is reported incomplete, not padded', async () => {
-  const pw = client(shiftingApi(records(5000), { shifted: [3], times: Infinity }));
-  const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
+  assert.equal(report.unique, 27651);
+  assert.equal(report.missing, 128);
   assert.equal(report.complete, false);
-  assert.equal(report.unique, 4936);
-  assert.equal(rows.length, 4936);
+  assert.equal(rows.length, 27651);
+  assert.equal(new Set(rows.map((r) => r.ModuleID)).size, 27651);
+  assert.equal(calls.length, 28);
+});
+
+test('getAll refuses a short read', async () => {
+  const pw = client(shiftingApi(records(5000), { shifted: [3], times: Infinity }));
   await assert.rejects(pw.getAll('/api/v1/Modules', {}, { idKeys: ['ModuleID'] }), IncompleteCollectionError);
+});
+
+test('page progress is reported as each page arrives', async () => {
+  const seen = [];
+  await client(fakeApi(records(4200))).getAllWithReport('/api/v1/Modules', {}, {
+    idKeys: ['ModuleID'], onProgress: (p) => seen.push(`${p.pagesDone}/${p.pages}`),
+  });
+  assert.deepEqual(seen, ['1/5', '2/5', '3/5', '4/5', '5/5']);
 });

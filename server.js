@@ -12,14 +12,19 @@
  *   GET  /api/health              — config sanity check for the UI
  *   GET  /api/users               — safe Projectworks user picker data
  *   GET  /api/offices             — the tenant's organisations (offices), cached
- *   GET  /api/grid?start&end[&includeArchived=1][&office=<OfficeID>|all][&fresh=1]
+ *   GET  /api/grid?start&end[&includeArchived=1][&office=<OfficeID>|all][&ifCached=1][&fresh=1]
  *                                 — { rows, netRows, supplierLines, meta }
+ *                                   Built from the window's last complete
+ *                                   snapshot (memory, then Postgres); read in
+ *                                   the foreground only when there is none.
  *                                   Archived projects are excluded and the
  *                                   office filter applied server-side, before
  *                                   any row is built or sent.
  *                                   netRows is the read-only Net position view:
  *                                   one row per project, planned invoicing minus
  *                                   subconsultant fees, per month.
+ *   POST /api/grid/refresh?start&end — start a background refresh ("Load data")
+ *   GET  /api/grid/refresh?start&end — its progress, per phase
  *   POST /api/forecast            — { moduleID, month:"YYYY-MM", amount, selectedProjectworksUserID, context }
  *                                   → POST /api/v1/Forecasts/Set. SERVICES
  *                                   MODULES ONLY: a non-services (consultant)
@@ -52,6 +57,8 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
+const { promisify } = require('util');
 const { createStorage, readStorageConfig } = require('./storage');
 const {
   aggregateExpenseActuals,
@@ -64,6 +71,8 @@ const {
   isMonth,
   moduleMonthTotals,
   parseList,
+  projectModuleIDs,
+  reconcileModules,
   resolveExpenseStatusFilter,
   resolveModuleCustomFields,
   summarizeInvoiceStatuses,
@@ -98,6 +107,10 @@ const MODULE_CUSTOM_FIELDS = MODULE_CUSTOM_FIELD_KEYS.map((key, index) => ({
 const MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID = String(process.env.MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID || '').trim();
 const DEFAULT_STAGE_SORT = String(process.env.DEFAULT_STAGE_SORT || '').trim();
 const PW_REQUEST_TIMEOUT_MS = Number(process.env.PW_REQUEST_TIMEOUT_MS);
+// Off by default: a full Modules + Invoices read at boot took 3.5–4 minutes on
+// Render and competed with the first user loads after every deploy. The same
+// diagnostics are logged, without extra API calls, after the first refresh.
+const STARTUP_DIAGNOSTICS = process.env.STARTUP_DIAGNOSTICS === 'true';
 
 // Hosted deployments hand the port in via the environment and require binding
 // to every interface; 0.0.0.0 is not configurable on purpose.
@@ -290,13 +303,12 @@ function primeCache(key, value) {
   referenceCache.set(key, { at: Date.now(), pending: false, promise: Promise.resolve(value) });
 }
 
-function invalidateCache(prefix) {
-  for (const key of [...referenceCache.keys()]) if (key.startsWith(prefix)) referenceCache.delete(key);
-}
-
-// Only the project fields the app reads; the full record carries every
-// project's Modules and CustomFields, which would hold tens of MB in memory.
+// Only the project fields the app reads. The full record also carries
+// CustomFields, which would hold tens of MB in memory. Its Modules list is a
+// plain array of ModuleIDs, kept as ModuleIDs: it is the exact expected module
+// set per project that reconcileModules checks the paged read against.
 function slimProject(p) {
+  const moduleIDs = projectModuleIDs(p);
   return {
     ProjectID: firstValue(p, ['ProjectID', 'projectID']),
     ProjectNumber: firstValue(p, ['ProjectNumber', 'projectNumber']),
@@ -309,12 +321,30 @@ function slimProject(p) {
     IsActive: firstValue(p, ['IsActive', 'isActive']),
     CurrencyID: firstValue(p, ['CurrencyID', 'currencyID']),
     CurrencyCode: firstValue(p, ['CurrencyCode', 'currencyCode']),
+    ...(moduleIDs ? { ModuleIDs: moduleIDs.map(Number) } : {}),
   };
 }
 
-// Modules come back with their Tasks; the grid never reads them.
+// Modules come back with their Tasks; the grid never reads them. Each custom
+// field entry keeps only what resolveModuleCustomFields reads (label, ID,
+// entity type, value), and every entry stays in place so the ordinal fallback
+// still lines up. Snapshots of ~28,000 modules live in memory on a 512 MB host.
+const CUSTOM_FIELD_ENTRY_KEYS = [
+  'Label', 'label', 'FieldLabel', 'fieldLabel', 'Name', 'name',
+  'FieldID', 'fieldID', 'fieldId', 'CustomFieldID', 'customFieldID', 'customFieldId', 'ID', 'id',
+  'EntityTypeID', 'entityTypeID', 'entityTypeId',
+  'Value', 'value', 'MultiSelectValues', 'multiSelectValues',
+];
+function slimCustomFieldEntry(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const out = {};
+  for (const key of CUSTOM_FIELD_ENTRY_KEYS) if (entry[key] !== undefined && entry[key] !== null) out[key] = entry[key];
+  return out;
+}
 function slimModule(m) {
-  const { Tasks, tasks, ...rest } = m || {};
+  const { Tasks, tasks, CustomFields, customFields, ...rest } = m || {};
+  if (Array.isArray(CustomFields)) rest.CustomFields = CustomFields.map(slimCustomFieldEntry);
+  if (Array.isArray(customFields)) rest.customFields = customFields.map(slimCustomFieldEntry);
   return rest;
 }
 
@@ -717,9 +747,10 @@ async function getProjectworksUserByID(id) {
 const MODULE_CACHE_MS = 5 * 60 * 1000;
 let modulesCache = { at: 0, byID: new Map() };
 
-function cacheModules(modules) {
+function cacheModules(modules, at = Date.now()) {
+  if (at < modulesCache.at) return;
   modulesCache = {
-    at: Date.now(),
+    at,
     byID: new Map(modules.map((m) => [String(firstValue(m, MODULE_ID_KEYS)), m])),
   };
 }
@@ -868,78 +899,373 @@ function monthEndDate(month) {
   return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
 }
 
-// The transactional sources (modules, invoices, forecasts, expense claims) are
-// held for a minute so that flipping "Show archived" or the organisation
-// filter re-filters on the server without re-reading ~60,000 records. "Load
-// data" passes fresh=1 and bypasses it; a forecast write clears it.
-const GRID_SOURCE_CACHE_MS = 60 * 1000;
+// ---- grid snapshots and background refresh ---------------------------------
+// One read of the grid sources (projects, ~28,000 modules, invoices, forecasts,
+// expense claims) takes ~10–15 s against SJB. The grid is therefore served from
+// the last complete snapshot of those sources, held in memory and in Postgres
+// so a restart or deploy does not lose it. "Load data" refreshes it in the
+// background: the old snapshot stays on screen until the new one is installed.
+// Filters (archived, organisation) rebuild rows from the snapshot and never
+// re-read Projectworks.
+//
+// Writes keep snapshots honest. A forecast write is patched into every
+// in-memory snapshot whose window holds that month and into any refresh in
+// flight; a stored-only snapshot for such a window is dropped. Supplier lines
+// are read from Postgres on every build, so they are never stale.
+const SNAPSHOTS_IN_MEMORY = 2;
+const SNAPSHOT_PERSIST_DELAY_MS = 2000;
+const FORECAST_PATCH_RETENTION_MS = 60 * 60 * 1000;
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+const snapshots = new Map();      // windowKey -> sources, least recently used first
+const snapshotLoads = new Map();  // windowKey -> in-flight Postgres restore
+const refreshJobs = new Map();    // windowKey -> latest refresh job, running or finished
+const persistTimers = new Map();  // windowKey -> debounce timer
+const persistChains = new Map();  // windowKey -> last save, so saves never overlap
+let forecastPatches = [];         // { at, moduleID, month, entries }, newest last
+let sourceDiagnosticsLogged = false;
 
-function loadGridSources(startMonth, endMonth, { fresh = false } = {}) {
-  return cached(`grid:${startMonth}:${endMonth}`, GRID_SOURCE_CACHE_MS, async () => {
-    const started = Date.now();
-    // Consultant Fees to Date is actual pre-tax expense spend through today.
-    const asOfDate = new Date().toISOString().slice(0, 10);
-    const reports = [];
-    const collect = async (pathname, params, opts) => {
-      const { rows, report } = await pw.getAllWithReport(pathname, params, { label: `GET ${pathname}`, ...opts });
-      reports.push(report);
-      if (report.complete && report.recoveryPasses) {
-        console.log(
-          `${report.label}: ${report.duplicates} records shifted between pages; dropped the duplicates and ` +
-          `re-fetched the rest in ${report.recoveryPasses} recovery pass(es) — ${report.unique} of ${report.total}.`
-        );
-      }
-      if (!report.complete) {
-        console.error(
-          `DATA INCOMPLETE: ${report.label} fetched ${report.unique} unique of ${report.total} ` +
-          `(x-total-count) across ${report.pages} pages${report.duplicates ? `, ${report.duplicates} duplicates` : ''}.`
-        );
-      }
-      return rows;
-    };
-    const [projects, offices, customFieldConfig, modules, invoices, forecasts, expenseClaims] = await Promise.all([
-      getProjects({ force: fresh }),
+const windowKeyOf = (startMonth, endMonth) => `${startMonth}:${endMonth}`;
+function windowHolds(windowKey, month) {
+  const [startMonth, endMonth] = windowKey.split(':');
+  return month >= startMonth && month <= endMonth; // 'YYYY-MM' sorts lexically
+}
+
+const REFRESH_PHASES = ['projects', 'reference', 'modules', 'reconcile', 'invoices', 'expenses', 'forecasts'];
+
+function createRefreshJob(windowKey) {
+  const phases = Object.fromEntries(REFRESH_PHASES.map((name) => [name, { status: 'pending' }]));
+  return {
+    windowKey,
+    status: 'running',
+    startedAt: Date.now(),
+    finishedAt: null,
+    error: null,
+    phases,
+    phase(name, status, ms) { Object.assign(phases[name], { status }, ms === undefined ? {} : { ms }); },
+    progress(name, { pagesDone, pages }) { Object.assign(phases[name], { pagesDone, pages }); },
+  };
+}
+
+function refreshStatus(job) {
+  if (!job) return { status: 'idle' };
+  return {
+    status: job.status,
+    startedAt: new Date(job.startedAt).toISOString(),
+    finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : null,
+    elapsedMs: (job.finishedAt || Date.now()) - job.startedAt,
+    error: job.error,
+    phases: job.phases,
+  };
+}
+
+const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
+const count = (n) => Number(n || 0).toLocaleString('en-US');
+
+/**
+ * One read of every grid source, timed per phase. Each collection is paged
+ * once and deduplicated by ID (pw-client never re-reads pages: the API's order
+ * is unstable, so re-reading cannot converge). The module set is then made
+ * exact for non-archived projects by reconcileModules, which re-reads by
+ * ProjectID only the projects whose listed modules did not arrive.
+ */
+async function fetchGridSources(startMonth, endMonth, job) {
+  const started = Date.now();
+  // Consultant Fees to Date is actual pre-tax expense spend through today.
+  const asOfDate = new Date().toISOString().slice(0, 10);
+  const timings = {};
+  const phase = async (name, work) => {
+    const t = Date.now();
+    job.phase(name, 'running');
+    try {
+      return await work();
+    } finally {
+      timings[name] = Date.now() - t;
+      job.phase(name, 'done', timings[name]);
+    }
+  };
+  const collect = (name, pathname, params, opts) => phase(name, () => pw.getAllWithReport(pathname, params, {
+    label: `GET ${pathname}`,
+    onProgress: (progress) => job.progress(name, progress),
+    ...opts,
+  }));
+
+  const work = {
+    projects: phase('projects', () => getProjects({ force: true })),
+    reference: phase('reference', () => Promise.all([
       getOffices(),
       cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
-      collect('/api/v1/Modules', { IncludeCustomFields: true }, { map: slimModule, idKeys: MODULE_ID_KEYS }),
-      collect('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'] }),
-      collect('/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) },
-        { idKeys: ['ForecastID', 'forecastID'] }),
-      collect('/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false },
-        { idKeys: ['ExpenseClaimID', 'expenseClaimID'] }),
-    ]);
-    // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
-    cacheModules(modules);
-    return {
-      projects, offices, customFieldConfig, modules, invoices, forecasts, expenseClaims,
-      reports, asOfDate, fetchedAt: Date.now(), fetchMs: Date.now() - started,
-    };
-  }, { force: fresh });
+    ])),
+    modules: collect('modules', '/api/v1/Modules', { IncludeCustomFields: true },
+      { map: slimModule, idKeys: MODULE_ID_KEYS }),
+    invoices: collect('invoices', '/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'] }),
+    expenses: collect('expenses', '/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false },
+      { idKeys: ['ExpenseClaimID', 'expenseClaimID'] }),
+    forecasts: collect('forecasts', '/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) },
+      { idKeys: ['ForecastID', 'forecastID'] }),
+  };
+  // Every phase is awaited below, but not at the same moment: an early failure
+  // in one must not leave a later rejection in another unhandled.
+  for (const promise of Object.values(work)) promise.catch(() => {});
+
+  const [projects, modulesRead] = await Promise.all([work.projects, work.modules]);
+  const reconciliation = await phase('reconcile', () => reconcileModules({
+    projects,
+    modules: modulesRead.rows,
+    isArchived: (project) => isArchivedProject(project, ARCHIVED_PROJECT_STATUSES),
+    fetchProjectModules: (projectID) => pw.getAllWithReport('/api/v1/Modules', { ProjectID: projectID, IncludeCustomFields: true },
+      { map: slimModule, idKeys: MODULE_ID_KEYS, label: `GET /api/v1/Modules?ProjectID=${projectID}` }),
+  }));
+  const [[offices, customFieldConfig], invoicesRead, expensesRead, forecastsRead] =
+    await Promise.all([work.reference, work.invoices, work.expenses, work.forecasts]);
+
+  // Completeness. Stages are checked exactly, per non-archived project, when
+  // the project records list their module IDs (the live API's do): a stage
+  // still missing there after reconciliation is the only module gap the UI is
+  // told about. Gaps on archived projects are a log line. Without those lists
+  // the collection's own x-total-count is all there is to go on. Invoices,
+  // expense claims and forecasts are checked against x-total-count.
+  const modulesReport = modulesRead.report;
+  const missingActiveStages = reconciliation.missingActive.reduce((n, gap) => n + gap.moduleIDs.length, 0);
+  const integrityErrors = [];
+  if (reconciliation.detectable) {
+    if (missingActiveStages) {
+      integrityErrors.push(
+        `GET /api/v1/Modules: ${count(missingActiveStages)} stage(s) on ${count(reconciliation.missingActive.length)} ` +
+        `active project(s) could not be read (ProjectID ${reconciliation.missingActive.map((gap) => gap.projectID).join(', ')}).`
+      );
+    }
+  } else if (!modulesReport.complete) {
+    integrityErrors.push(`GET /api/v1/Modules: fetched ${count(modulesReport.unique)} of ${count(modulesReport.total)} records` +
+      `${modulesReport.duplicates ? ` (${count(modulesReport.duplicates)} duplicated across pages)` : ''}.`);
+  }
+  for (const { report } of [invoicesRead, expensesRead, forecastsRead]) {
+    if (!report.complete) {
+      integrityErrors.push(`${report.label}: fetched ${count(report.unique)} of ${count(report.total)} records` +
+        `${report.duplicates ? ` (${count(report.duplicates)} duplicated across pages)` : ''}.`);
+    }
+  }
+
+  const fetchMs = Date.now() - started;
+  const reconcileNote = reconciliation.detectable
+    ? `${reconciliation.refetchedProjects} active project(s) re-read, ${reconciliation.recovered} stage(s) recovered`
+    : 'no project module lists, not checked';
+  console.log(
+    `grid refresh ${startMonth}..${endMonth} in ${seconds(fetchMs)}: ` +
+    `projects ${seconds(timings.projects)} (${count(projects.length)}) · reference ${seconds(timings.reference)} · ` +
+    `modules ${seconds(timings.modules)} (${count(modulesReport.unique)} of ${count(modulesReport.total)}, ` +
+    `${count(modulesReport.duplicates)} duplicate(s)) · reconcile ${seconds(timings.reconcile)} (${reconcileNote}) · ` +
+    `invoices ${seconds(timings.invoices)} (${count(invoicesRead.rows.length)}) · ` +
+    `expenses ${seconds(timings.expenses)} (${count(expensesRead.rows.length)}) · ` +
+    `forecasts ${seconds(timings.forecasts)} (${count(forecastsRead.rows.length)})`
+  );
+  if (reconciliation.missingArchived) {
+    console.log(
+      `  ${count(reconciliation.missingArchived)} stage(s) on ${count(reconciliation.missingArchivedProjects)} archived ` +
+      'project(s) were not returned by the paged read; archived projects are hidden by default and are not re-read.'
+    );
+  }
+  for (const message of integrityErrors) console.error(`DATA INCOMPLETE: ${message}`);
+
+  return {
+    startMonth,
+    endMonth,
+    projects,
+    offices,
+    customFieldConfig,
+    modules: reconciliation.modules,
+    invoices: invoicesRead.rows,
+    forecasts: forecastsRead.rows,
+    expenseClaims: expensesRead.rows,
+    asOfDate,
+    integrityErrors,
+    collections: [
+      {
+        label: modulesReport.label,
+        fetched: reconciliation.modules.length,
+        total: modulesReport.total,
+        pages: modulesReport.pages,
+        verifiedBy: reconciliation.detectable ? 'project-module-lists' : modulesReport.verifiedBy,
+        complete: reconciliation.detectable ? missingActiveStages === 0 : modulesReport.complete,
+      },
+      ...[invoicesRead, expensesRead, forecastsRead].map(({ report }) => ({
+        label: report.label, fetched: report.unique, total: report.total, pages: report.pages,
+        verifiedBy: report.verifiedBy, complete: report.complete,
+      })),
+    ],
+    reconciliation: {
+      detectable: reconciliation.detectable,
+      duplicates: modulesReport.duplicates,
+      pagedReadMissing: modulesReport.missing,
+      refetchedProjects: reconciliation.refetchedProjects,
+      recovered: reconciliation.recovered,
+      missingActiveStages,
+      missingArchivedStages: reconciliation.missingArchived,
+      missingArchivedProjects: reconciliation.missingArchivedProjects,
+    },
+    timings: { ...timings, total: fetchMs },
+    fetchMs,
+    fetchedAt: Date.now(),
+  };
+}
+
+function patchForecasts(sources, { moduleID, month, entries }) {
+  const sameCell = (forecast) => String(firstValue(forecast, MODULE_ID_KEYS)) === String(moduleID) &&
+    String(firstValue(forecast, ['Date', 'date']) || '').slice(0, 7) === month;
+  sources.forecasts = sources.forecasts.filter((forecast) => !sameCell(forecast)).concat(entries);
+}
+
+/** Re-apply the forecast writes made since `since` to a snapshot read before them. */
+function applyForecastPatches(sources, since) {
+  const windowKey = windowKeyOf(sources.startMonth, sources.endMonth);
+  for (const patch of forecastPatches) {
+    if (patch.at >= since && windowHolds(windowKey, patch.month)) patchForecasts(sources, patch);
+  }
 }
 
 /**
- * Startup diagnostics, logged once after the server is listening. Nothing here
- * reaches the UI: these are the settings an operator corrects in the
- * environment, so the log is where they belong.
+ * A forecast cell was written to Projectworks. Forecasts/Set replaces the
+ * module-month, so the cell's value is now exactly `amount`; every snapshot
+ * that shows it is patched rather than re-read.
+ */
+async function recordForecastWrite(moduleID, projectID, month, amount) {
+  const now = Date.now();
+  const patch = {
+    at: now,
+    moduleID,
+    month,
+    entries: [{ ModuleID: moduleID, ProjectID: projectID, Date: `${month}-01T00:00:00`, Amount: amount }],
+  };
+  forecastPatches = forecastPatches.filter((p) => p.at > now - FORECAST_PATCH_RETENTION_MS).slice(-4999);
+  forecastPatches.push(patch);
+  for (const [windowKey, sources] of snapshots) {
+    if (!windowHolds(windowKey, month)) continue;
+    patchForecasts(sources, patch);
+    schedulePersist(windowKey, sources);
+  }
+  // A window held only in Postgres is dropped rather than patched; the next
+  // load of it refreshes from Projectworks.
+  try {
+    for (const windowKey of await storage.listGridSnapshots()) {
+      if (!snapshots.has(windowKey) && windowHolds(windowKey, month)) await storage.deleteGridSnapshot(windowKey);
+    }
+  } catch (err) {
+    console.error(`Stored grid snapshots could not be invalidated after a forecast write: ${String(err.message || err)}`);
+  }
+}
+
+function installSnapshot(windowKey, sources) {
+  snapshots.delete(windowKey);
+  snapshots.set(windowKey, sources);
+  while (snapshots.size > SNAPSHOTS_IN_MEMORY) snapshots.delete(snapshots.keys().next().value);
+  // Keeps the IsServices guard on /api/forecast warm; it re-checks a module
+  // directly once the snapshot is older than MODULE_CACHE_MS.
+  cacheModules(sources.modules, sources.fetchedAt);
+}
+
+async function persistSnapshot(windowKey, sources) {
+  const started = Date.now();
+  try {
+    const payload = await gzip(Buffer.from(JSON.stringify(sources)));
+    await storage.saveGridSnapshot(windowKey, new Date(sources.fetchedAt), payload);
+    console.log(`grid snapshot ${windowKey} saved to Postgres (${(payload.length / 1048576).toFixed(1)} MB gzipped) in ${Date.now() - started}ms`);
+  } catch (err) {
+    console.error(`grid snapshot ${windowKey} could not be saved: ${String(err.message || err)}`);
+  }
+}
+
+function schedulePersist(windowKey, sources, delayMs = SNAPSHOT_PERSIST_DELAY_MS) {
+  clearTimeout(persistTimers.get(windowKey));
+  persistTimers.set(windowKey, setTimeout(() => {
+    persistTimers.delete(windowKey);
+    const previous = persistChains.get(windowKey) || Promise.resolve();
+    persistChains.set(windowKey, previous.then(() => persistSnapshot(windowKey, sources)));
+  }, delayMs));
+}
+
+/** The window's snapshot from memory, else restored from Postgres, else null. */
+function getSnapshot(windowKey) {
+  const hit = snapshots.get(windowKey);
+  if (hit) {
+    snapshots.delete(windowKey);
+    snapshots.set(windowKey, hit);
+    return Promise.resolve(hit);
+  }
+  if (!snapshotLoads.has(windowKey)) {
+    const load = (async () => {
+      const started = Date.now();
+      try {
+        const stored = await storage.loadGridSnapshot(windowKey);
+        if (!stored) return null;
+        const sources = JSON.parse((await gunzip(stored.payload)).toString('utf8'));
+        // A refresh may have installed a newer snapshot while this one was read.
+        const current = snapshots.get(windowKey);
+        if (current && current.fetchedAt >= sources.fetchedAt) return current;
+        applyForecastPatches(sources, sources.fetchedAt);
+        installSnapshot(windowKey, sources);
+        console.log(`grid snapshot ${windowKey} restored from Postgres (fetched ${new Date(sources.fetchedAt).toISOString()}) in ${Date.now() - started}ms`);
+        return sources;
+      } catch (err) {
+        console.error(`grid snapshot ${windowKey} could not be restored: ${String(err.message || err)}`);
+        return null;
+      } finally {
+        snapshotLoads.delete(windowKey);
+      }
+    })();
+    snapshotLoads.set(windowKey, load);
+  }
+  return snapshotLoads.get(windowKey);
+}
+
+/**
+ * Start the background refresh of one window, or join the one already
+ * running. job.promise resolves to the new sources, or null on failure (the
+ * job records the error); it never rejects. The previous snapshot is served
+ * until this one is installed.
+ */
+function startRefresh(startMonth, endMonth) {
+  const windowKey = windowKeyOf(startMonth, endMonth);
+  const running = refreshJobs.get(windowKey);
+  if (running && running.status === 'running') return running;
+  const job = createRefreshJob(windowKey);
+  refreshJobs.set(windowKey, job);
+  job.promise = fetchGridSources(startMonth, endMonth, job).then((sources) => {
+    applyForecastPatches(sources, job.startedAt);
+    installSnapshot(windowKey, sources);
+    schedulePersist(windowKey, sources, 0);
+    job.status = 'done';
+    job.finishedAt = Date.now();
+    if (!sourceDiagnosticsLogged) {
+      sourceDiagnosticsLogged = true;
+      logSourceDiagnostics(sources);
+    }
+    return sources;
+  }, (err) => {
+    job.status = 'error';
+    job.error = String((err && err.message) || err);
+    job.finishedAt = Date.now();
+    console.error(`grid refresh ${startMonth}..${endMonth} failed after ${seconds(job.finishedAt - job.startedAt)}: ${job.error}`);
+    return null;
+  });
+  return job;
+}
+
+/**
+ * Operator diagnostics, logged once per process after the first refresh (no
+ * API calls of their own). Nothing here reaches the UI: these are settings an
+ * operator corrects in the environment.
  *
  *   - each MODULE_CUSTOM_FIELD_LABELS label: on how many stages it was found
  *   - invoices fetched, their distinct statuses, and how many match
  *     INVOICE_STATUS_CODES
  */
-async function logStartupDiagnostics() {
-  const [customFieldConfig, modules, invoices] = await Promise.all([
-    cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
-    pw.getAllWithReport('/api/v1/Modules', { IncludeCustomFields: true },
-      { map: slimModule, idKeys: MODULE_ID_KEYS, label: 'GET /api/v1/Modules' }),
-    pw.getAllWithReport('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'], label: 'GET /api/v1/Invoices' }),
-  ]);
-
+function logSourceDiagnostics({ customFieldConfig, modules, invoices, invoicesNote = '' }) {
   const found = new Map(MODULE_CUSTOM_FIELDS.map((field) => [field.key, 0]));
-  for (const m of modules.rows) {
+  for (const m of modules) {
     const custom = resolveModuleCustomFields(m, customFieldConfig.definitions, MODULE_CUSTOM_FIELDS, customFieldConfig.entityTypeID);
     for (const key of custom.matched) found.set(key, found.get(key) + 1);
   }
-  console.log(`  Custom fields (${modules.rows.length} stages):`);
+  console.log(`  Custom fields (${modules.length} stages):`);
   for (const field of MODULE_CUSTOM_FIELDS) {
     const n = found.get(field.key);
     const line = `    "${field.label}": ${n ? `returned on ${n} stages` : 'NOT FOUND on any stage — column will be blank'}`;
@@ -949,12 +1275,28 @@ async function logStartupDiagnostics() {
 
   // SJB has no invoices until its data migration, so $0 Fees to Date is
   // expected for now; this line confirms the status match once they arrive.
-  const summary = summarizeInvoiceStatuses(invoices.rows, STATUS_CODES);
+  const summary = summarizeInvoiceStatuses(invoices, STATUS_CODES);
   console.log(
-    `  Invoices:  ${summary.total} fetched${invoices.report.complete ? '' : ` (INCOMPLETE: x-total-count ${invoices.report.total})`}; ` +
+    `  Invoices:  ${summary.total} fetched${invoicesNote}; ` +
     `statuses seen: ${summary.statuses.map(([status, n]) => `${status} ×${n}`).join(', ') || 'none'}; ` +
     `${summary.matched} match INVOICE_STATUS_CODES`
   );
+}
+
+/** STARTUP_DIAGNOSTICS=true only: the same diagnostics, from a full read at boot. */
+async function logStartupDiagnostics() {
+  const [customFieldConfig, modules, invoices] = await Promise.all([
+    cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
+    pw.getAllWithReport('/api/v1/Modules', { IncludeCustomFields: true },
+      { map: slimModule, idKeys: MODULE_ID_KEYS, label: 'GET /api/v1/Modules' }),
+    pw.getAllWithReport('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'], label: 'GET /api/v1/Invoices' }),
+  ]);
+  logSourceDiagnostics({
+    customFieldConfig,
+    modules: modules.rows,
+    invoices: invoices.rows,
+    invoicesNote: invoices.report.complete ? '' : ` (INCOMPLETE: x-total-count ${invoices.report.total})`,
+  });
 }
 
 /**
@@ -965,12 +1307,11 @@ async function logStartupDiagnostics() {
  * aggregation, custom-field resolution or serialisation — the browser never
  * receives them.
  */
-async function buildGrid(startMonth, endMonth, options = {}) {
+async function buildGrid(sources, options = {}) {
+  const { startMonth, endMonth } = sources;
   const includeArchived = !!options.includeArchived;
   const officeID = options.officeID ? String(options.officeID) : '';
-  const requestStarted = Date.now();
-  const sources = await loadGridSources(startMonth, endMonth, { fresh: !!options.fresh });
-  const fromCache = sources.fetchedAt < requestStarted;
+  const fromSnapshot = !!options.fromSnapshot;
   const buildStarted = Date.now();
   const { offices, customFieldConfig, invoices, forecasts, expenseClaims, asOfDate } = sources;
   const customFieldDefinitions = customFieldConfig.definitions;
@@ -1106,12 +1447,10 @@ async function buildGrid(startMonth, endMonth, options = {}) {
   const expenseCurrencyIssueCount = [...expenseActuals.currencyIssuesByModule.values()]
     .reduce((sum, issue) => sum + issue.count, 0);
 
-  // Completeness: any collection whose fetched count disagrees with the API's
-  // x-total-count is reported to the UI as a red banner. Nothing is hidden.
-  const integrityErrors = sources.reports
-    .filter((report) => !report.complete)
-    .map((report) => `${report.label}: fetched ${report.unique} of ${report.total} records` +
-      `${report.duplicates ? ` (${report.duplicates} duplicated across pages)` : ''}.`);
+  // Completeness was settled when the snapshot was read (fetchGridSources):
+  // the red banner is for stages missing on active projects after
+  // reconciliation, and for short invoice / expense / forecast reads.
+  const integrityErrors = sources.integrityErrors;
 
   // A configured expense status that is neither an ID nor a known name can only
   // match a status-name field on the claim. If the claims carry none, that
@@ -1122,6 +1461,15 @@ async function buildGrid(startMonth, endMonth, options = {}) {
     .filter((entry) => entry.source === 'name-field' && expenseClaims.length && !claimsHaveStatusNames)
     .map((entry) => entry.configured);
   const warnings = [];
+  const reconciliation = sources.reconciliation || {};
+  if (includeArchived && reconciliation.missingArchivedStages) {
+    // Archived gaps are not re-read (they are hidden by default); say so only
+    // when archived projects are on screen.
+    warnings.push(
+      `${count(reconciliation.missingArchivedStages)} stage(s) on ${count(reconciliation.missingArchivedProjects)} archived ` +
+      'project(s) did not arrive from Projectworks and are not shown. Active projects are complete.'
+    );
+  }
   if (unresolvedExpenseStatuses.length) {
     warnings.push(
       `EXPENSE_STATUS_CODES value(s) ${unresolvedExpenseStatuses.map((v) => `"${v}"`).join(', ')} could not be resolved: ` +
@@ -1131,10 +1479,12 @@ async function buildGrid(startMonth, endMonth, options = {}) {
   }
 
   const buildMs = Date.now() - buildStarted;
+  const snapshotAgeMs = Date.now() - sources.fetchedAt;
   console.log(
     `grid ${startMonth}..${endMonth}: ${rows.length} of ${sources.modules.length} stages, ${projects.length} of ` +
     `${sources.projects.length} projects (archived ${includeArchived ? 'shown' : 'excluded'}, office ${officeID || 'all'}); ` +
-    `sources ${fromCache ? 'from cache' : `fetched in ${sources.fetchMs}ms`}, built in ${buildMs}ms`
+    `sources ${fromSnapshot ? `from snapshot (age ${seconds(snapshotAgeMs)})` : `fetched in ${sources.fetchMs}ms`}, ` +
+    `build ${buildMs}ms`
   );
 
   return {
@@ -1156,12 +1506,15 @@ async function buildGrid(startMonth, endMonth, options = {}) {
       dataComplete: integrityErrors.length === 0,
       integrityErrors,
       warnings,
-      collections: sources.reports.map(({ label, unique, total, pages, verifiedBy, complete }) =>
-        ({ label, fetched: unique, total, pages, verifiedBy, complete })),
+      collections: sources.collections,
+      reconciliation,
       fetchMs: sources.fetchMs,
+      timings: sources.timings,
       buildMs,
-      fromCache,
+      fromSnapshot,
       fetchedAt: new Date(sources.fetchedAt).toISOString(),
+      snapshotAgeMs,
+      refresh: refreshStatus(options.refresh),
       archivedProjectStatuses: ARCHIVED_PROJECT_STATUSES,
       invoiceStatusFilter: STATUS_CODES.length ? STATUS_CODES : 'ALL (unfiltered — confirm before demoing revenue figures)',
       invoiceStatusesSeen: [...invoiceActuals.statusesSeen].filter(Boolean),
@@ -1272,30 +1625,65 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-app.get('/api/grid', async (req, res) => {
-  const { start, end } = req.query;
-  if (!isMonth(start) || !isMonth(end)) {
-    return res.status(400).json({ error: 'start and end are required as YYYY-MM' });
-  }
+const flag = (value) => ['1', 'true', 'yes'].includes(String(value || '').toLowerCase());
+
+/** start/end from the query as a forecast range, or an error message. */
+function parseWindow(query) {
+  const { start, end } = query;
+  if (!isMonth(start) || !isMonth(end)) return { error: 'start and end are required as YYYY-MM' };
   const months = monthRangeSize(start, end);
-  if (months < 1 || months > 36) {
-    return res.status(400).json({ error: 'forecast range must be between 1 and 36 months' });
-  }
-  const flag = (value) => ['1', 'true', 'yes'].includes(String(value || '').toLowerCase());
+  if (months < 1 || months > 36) return { error: 'forecast range must be between 1 and 36 months' };
+  return { start, end, windowKey: windowKeyOf(start, end) };
+}
+
+/**
+ * The grid, built from the range's snapshot. With no snapshot yet (or
+ * fresh=1) the sources are read in the foreground, joining any refresh already
+ * running. ifCached=1 never reads Projectworks: with no snapshot it answers
+ * { snapshot: false } — the page-load path, which must be instant.
+ */
+app.get('/api/grid', async (req, res) => {
+  const range = parseWindow(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
   const office = String(req.query.office || '').trim();
   if (office && office !== 'all' && !/^\d+$/.test(office)) {
     return res.status(400).json({ error: 'office must be "all" or a numeric OfficeID' });
   }
   try {
-    res.json(await buildGrid(start, end, {
+    let sources = flag(req.query.fresh) ? null : await getSnapshot(range.windowKey);
+    const fromSnapshot = !!sources;
+    if (!sources) {
+      if (flag(req.query.ifCached)) {
+        return res.json({ snapshot: false, refresh: refreshStatus(refreshJobs.get(range.windowKey)) });
+      }
+      const job = startRefresh(range.start, range.end);
+      sources = await job.promise;
+      if (!sources) throw new Error(job.error);
+    }
+    res.json(await buildGrid(sources, {
       includeArchived: flag(req.query.includeArchived),
       officeID: office === 'all' ? '' : office,
-      fresh: flag(req.query.fresh),
+      fromSnapshot,
+      refresh: refreshJobs.get(range.windowKey),
     }));
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: String(err.message || err) });
   }
+});
+
+/** "Load data": start (or join) a background refresh of the range. Read-only against Projectworks. */
+app.post('/api/grid/refresh', (req, res) => {
+  const range = parseWindow(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  res.status(202).json(refreshStatus(startRefresh(range.start, range.end)));
+});
+
+/** Progress of the range's latest refresh: idle, running (per-phase), done or error. */
+app.get('/api/grid/refresh', (req, res) => {
+  const range = parseWindow(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  res.json(refreshStatus(refreshJobs.get(range.windowKey)));
 });
 
 app.get('/api/offices', async (_req, res) => {
@@ -1329,11 +1717,12 @@ app.post('/api/forecast', async (req, res) => {
   }
   let auditUser;
   let previousAmount;
+  let servicesModule;
   try {
     auditUser = await resolveSelectedAuditUser(req.body);
     // The only route that writes to Projectworks, so this is the only place the
     // consultant/services boundary has to hold. It fails closed.
-    await assertServicesModule(moduleNumber);
+    servicesModule = await assertServicesModule(moduleNumber);
     // The audit's previous value is read from Projectworks, never trusted from
     // browser-supplied context. If it cannot be read, the write is refused.
     previousAmount = await pwForecastAmount(moduleNumber, month);
@@ -1373,8 +1762,8 @@ app.post('/api/forecast', async (req, res) => {
       : '');
   }
   if (!result.ok) return res.status(502).json({ error: result.error });
-  // The cached forecast window no longer matches Projectworks.
-  invalidateCache('grid:');
+  // Snapshots showing this cell are patched, not re-read.
+  await recordForecastWrite(moduleNumber, firstValue(servicesModule, PROJECT_ID_KEYS), month, amountNumber);
   res.json({ ok: true });
 });
 
@@ -1579,9 +1968,20 @@ app.get('/api/audit', async (_req, res) => {
       console.warn('');
     }
 
-    logStartupDiagnostics().catch((err) => {
-      console.warn(`  Startup diagnostics could not run: ${String(err && err.message ? err.message : err)}`);
-    });
+    if (STARTUP_DIAGNOSTICS) {
+      logStartupDiagnostics().catch((err) => {
+        console.warn(`  Startup diagnostics could not run: ${String(err && err.message ? err.message : err)}`);
+      });
+    } else {
+      console.log('  Diagnostics: logged after the first grid refresh (STARTUP_DIAGNOSTICS=true reads them at boot)');
+    }
+
+    // Restore the default window's snapshot (current month + 11, as the UI
+    // opens with) from Postgres, so the first page load is served from memory.
+    // No Projectworks call.
+    const now = new Date();
+    const ym = (offset) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 15)).toISOString().slice(0, 7);
+    getSnapshot(windowKeyOf(ym(0), ym(11)));
   });
 })().catch((err) => {
   refuseToStart([
