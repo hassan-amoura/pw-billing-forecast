@@ -883,7 +883,9 @@
         : '';
       const missingFields = data.meta.missingCustomFields || [];
       const customFieldIssue = data.meta.customFieldEntityTypeIssue || '';
-      const hasCustomFieldWarning = missingFields.length > 0 || !!customFieldIssue;
+      // Fields resolve by label, so the entity-type note only matters when a
+      // configured field is actually missing.
+      const hasCustomFieldWarning = missingFields.length > 0;
       $('notice-custom-fields').classList.toggle('hidden', !hasCustomFieldWarning);
       $('notice-custom-fields').innerHTML = hasCustomFieldWarning
         ? (missingFields.length
