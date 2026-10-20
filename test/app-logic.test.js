@@ -7,9 +7,11 @@ const {
   aggregateForecasts,
   aggregateInvoiceFees,
   buildNetRows,
-  collectPages,
   compareTenantOfficeNames,
+  isArchivedProject,
   moduleMonthTotals,
+  parseList,
+  resolveExpenseStatusFilter,
   resolveModuleCustomFields,
 } = require('../app-logic');
 
@@ -172,21 +174,49 @@ test('net position subtracts consultant planning and preserves distinct stage me
   assert.equal(net[0].riskStatus, 'Low · High');
 });
 
-test('pagination returns complete collections and refuses a full safety-limit page', async () => {
-  const pages = [[1, 2], [3]];
-  const complete = await collectPages(async (page) => pages[page - 1], {
-    pageSize: 2,
-    maxPages: 3,
-    label: 'test collection',
-  });
-  assert.deepEqual(complete, [1, 2, 3]);
+test('env lists split on commas and trim whitespace around every item', () => {
+  assert.deepEqual(parseList(' Stage No , Risk Status,Des / Del ,'), ['Stage No', 'Risk Status', 'Des / Del']);
+  assert.deepEqual(parseList('Finance Approved'), ['Finance Approved']);
+  assert.deepEqual(parseList('  SJB  MEL ,SJB SYD'), ['SJB MEL', 'SJB SYD']);
+  assert.deepEqual(parseList(undefined), []);
+});
 
-  await assert.rejects(
-    collectPages(async () => [1, 2], { pageSize: 2, maxPages: 2, label: 'test collection' }),
-    /4-record safety limit/
-  );
-  await assert.rejects(
-    collectPages(async () => ({ items: [] }), { pageSize: 2, maxPages: 2, label: 'test collection' }),
-    /non-array response/
-  );
+test('a project is archived by IsActive=false or by an archived workflow status', () => {
+  const statuses = ['Archived'];
+  assert.equal(isArchivedProject({ IsActive: false, ProjectStatusName: 'Signed' }, statuses), true);
+  assert.equal(isArchivedProject({ isActive: false }, statuses), true);
+  // SJB's tenant: IsActive stays true and the status carries the archive.
+  assert.equal(isArchivedProject({ IsActive: true, ProjectStatusName: 'Archived' }, statuses), true);
+  assert.equal(isArchivedProject({ IsActive: true, ProjectStatusName: ' archived ' }, statuses), true);
+  assert.equal(isArchivedProject({ IsActive: true, ProjectStatusName: 'Signed' }, statuses), false);
+  assert.equal(isArchivedProject({ IsActive: true, ProjectStatusName: 'Unsigned (opportunity)' }, statuses), false);
+});
+
+test('invoice status filter matches status names case- and space-insensitively', () => {
+  const invoices = aggregateInvoiceFees([
+    { StatusCode: 'Finance Approved', Lines: [{ ModuleID: 1, Amount: 100 }] },
+    { StatusCode: 'finance  approved', Lines: [{ ModuleID: 1, Amount: 10 }] },
+    { StatusCode: 'Approved', Lines: [{ ModuleID: 1, Amount: 1000 }] },
+    { StatusCode: 'Draft', Lines: [{ ModuleID: 1, Amount: 5000 }] },
+  ], ['Finance Approved']);
+  assert.equal(invoices.totalsByModule.get('1'), 110);
+});
+
+test('expense status names resolve to IDs; unknown names match only a status-name field', () => {
+  const byName = resolveExpenseStatusFilter(['Approved']);
+  assert.deepEqual([...byName.ids], ['4']);
+  assert.deepEqual(byName.resolved, [{ configured: 'Approved', id: '4', source: 'built-in' }]);
+
+  const mixed = resolveExpenseStatusFilter(['7', 'Signed Off']);
+  assert.deepEqual([...mixed.ids], ['7']);
+  assert.equal(mixed.resolved[1].source, 'name-field');
+
+  const claims = [
+    { ExpenseClaimStatusID: 4, ModuleID: 10, Date: '2026-08-01T00:00:00Z', AmountWithoutTax: 100, CurrencyID: 1, IsPlanned: false },
+    { ExpenseClaimStatusID: 2, ModuleID: 10, Date: '2026-08-01T00:00:00Z', AmountWithoutTax: 900, CurrencyID: 1, IsPlanned: false },
+    { ExpenseClaimStatusID: 9, ExpenseClaimStatusName: 'Signed off', ModuleID: 10, Date: '2026-08-02T00:00:00Z', AmountWithoutTax: 30, CurrencyID: 1, IsPlanned: false },
+  ];
+  const options = { moduleProject: new Map([['10', '100']]), projectCurrency: new Map([['100', 1]]), asOfDate: '2026-09-01' };
+  assert.equal(aggregateExpenseActuals(claims, { ...options, statusFilter: byName }).totalsByModule.get('10'), 100);
+  assert.equal(aggregateExpenseActuals(claims, { ...options, statusFilter: mixed }).totalsByModule.get('10'), 30);
 });

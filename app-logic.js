@@ -16,6 +16,14 @@ function firstValue(object, keys) {
   return undefined;
 }
 
+/** Comma-separated env list: trimmed, inner whitespace collapsed, empties dropped. */
+function parseList(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((item) => item.trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
 function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -127,15 +135,77 @@ function resolveModuleCustomFields(module, definitions, configuredLabels, module
   return { values, matched, usedOrdinal };
 }
 
+/**
+ * A project is archived when Projectworks marks it inactive OR its workflow
+ * status is one of the archived status names. Both signals are needed: the
+ * swagger documents isActive, but SJB's tenant keeps IsActive=true on every
+ * project and archives through ProjectStatusName "Archived" (2,766 of 3,685
+ * projects, verified live 2026-10-20).
+ */
+function isArchivedProject(project, archivedStatusNames) {
+  const active = firstValue(project, ['IsActive', 'isActive']);
+  if (active === false || String(active).toLowerCase() === 'false') return true;
+  const status = normalizedLabel(firstValue(project, ['ProjectStatusName', 'projectStatusName']));
+  return !!status && asArray(archivedStatusNames).some((name) => normalizedLabel(name) === status);
+}
+
+/**
+ * Projectworks expense claims carry only a numeric expenseClaimStatusID, and
+ * the Open API has no endpoint that names those IDs (ExpenseClaims/Statuses
+ * and similar return 404). Configured values may therefore be IDs, or names
+ * that resolve through this table. Evidence for each entry is recorded here:
+ *
+ *   Approved → 4: every one of SJB's 13,297 live expense claims carried
+ *   ExpenseClaimStatusID 4, and the SJB deployment ran EXPENSE_STATUS_CODES=4
+ *   as its approved filter before the value was switched to the name.
+ */
+const KNOWN_EXPENSE_STATUS_IDS = new Map([['approved', '4']]);
+const EXPENSE_STATUS_NAME_KEYS = ['ExpenseClaimStatusName', 'expenseClaimStatusName', 'StatusName', 'statusName'];
+
+function resolveExpenseStatusFilter(configured) {
+  const ids = new Set();
+  const names = new Set();
+  const resolved = [];
+  for (const raw of asArray(configured)) {
+    const value = String(raw).trim();
+    if (!value) continue;
+    if (/^\d+$/.test(value)) {
+      ids.add(value);
+      resolved.push({ configured: value, id: value, source: 'id' });
+      continue;
+    }
+    const key = normalizedLabel(value);
+    names.add(key);
+    const known = KNOWN_EXPENSE_STATUS_IDS.get(key);
+    if (known) {
+      ids.add(known);
+      resolved.push({ configured: value, id: known, source: 'built-in' });
+    } else {
+      resolved.push({ configured: value, id: null, source: 'name-field' });
+    }
+  }
+  return { ids, names, resolved };
+}
+
+/** True when a claim's status is in the resolved filter (by ID, or by a name field if the API sends one). */
+function expenseStatusAllowed(claim, filter) {
+  const id = firstValue(claim, ['ExpenseClaimStatusID', 'expenseClaimStatusID']);
+  if (id !== undefined && id !== null && filter.ids.has(String(id).trim())) return true;
+  const name = normalizedLabel(firstValue(claim, EXPENSE_STATUS_NAME_KEYS));
+  return !!name && filter.names.has(name);
+}
+
+/** Invoice statuses match on StatusCode text (case/space-insensitive) or a numeric StatusID. */
 function aggregateInvoiceFees(invoices, allowedStatusCodes) {
-  const allowed = new Set(allowedStatusCodes.map(String));
+  const allowed = new Set(allowedStatusCodes.map(normalizedLabel));
   const totalsByModule = new Map();
   const statusesSeen = new Set();
 
   for (const invoice of invoices) {
     const status = firstValue(invoice, ['StatusCode', 'statusCode']);
+    const statusID = firstValue(invoice, ['StatusID', 'statusID']);
     if (status !== undefined && status !== null && String(status).trim()) statusesSeen.add(String(status));
-    if (allowed.size && !allowed.has(String(status))) continue;
+    if (allowed.size && !allowed.has(normalizedLabel(status)) && !allowed.has(normalizedLabel(statusID))) continue;
     for (const line of asArray(firstValue(invoice, ['Lines', 'lines']))) {
       const moduleID = firstValue(line, ['ModuleID', 'moduleID']);
       if (moduleID === undefined || moduleID === null) continue;
@@ -149,7 +219,7 @@ function aggregateInvoiceFees(invoices, allowedStatusCodes) {
 }
 
 function aggregateExpenseActuals(expenseClaims, options) {
-  const allowed = new Set(options.allowedStatusIDs.map(String));
+  const filter = options.statusFilter || resolveExpenseStatusFilter(options.allowedStatusIDs);
   const moduleProject = options.moduleProject;
   const projectCurrency = options.projectCurrency;
   const asOfDate = String(options.asOfDate);
@@ -166,7 +236,7 @@ function aggregateExpenseActuals(expenseClaims, options) {
   for (const claim of expenseClaims) {
     const status = firstValue(claim, ['ExpenseClaimStatusID', 'expenseClaimStatusID']);
     if (status !== undefined && status !== null && String(status).trim()) statusesSeen.add(String(status));
-    if (!allowed.has(String(status))) continue;
+    if (!expenseStatusAllowed(claim, filter)) continue;
 
     const planned = firstValue(claim, ['IsPlanned', 'isPlanned']);
     if (planned === true || String(planned).toLowerCase() === 'true') {
@@ -225,6 +295,7 @@ function aggregateExpenseActuals(expenseClaims, options) {
     totalsByModule,
     monthsByModule,
     statusesSeen,
+    statusFilter: filter,
     currencyIssuesByModule,
     plannedExcluded,
     futureExcluded,
@@ -335,31 +406,19 @@ function buildNetRows(rows, inWindow) {
   return output;
 }
 
-async function collectPages(fetchPage, options = {}) {
-  const pageSize = options.pageSize || 200;
-  const maxPages = options.maxPages || 100;
-  const label = options.label || 'collection';
-  const output = [];
-
-  for (let page = 1; page <= maxPages; page += 1) {
-    const batch = await fetchPage(page, pageSize);
-    if (!Array.isArray(batch)) throw new Error(`${label} returned a non-array response; check the endpoint shape.`);
-    output.push(...batch);
-    if (batch.length < pageSize) return output;
-  }
-  throw new Error(`${label} hit the ${maxPages * pageSize}-record safety limit; refusing to show incomplete data.`);
-}
-
 module.exports = {
   aggregateExpenseActuals,
   aggregateForecasts,
   aggregateInvoiceFees,
   buildNetRows,
-  collectPages,
   compareTenantOfficeNames,
+  expenseStatusAllowed,
   firstValue,
+  isArchivedProject,
   isMonth,
   moduleMonthTotals,
   normalizedLabel,
+  parseList,
+  resolveExpenseStatusFilter,
   resolveModuleCustomFields,
 };
