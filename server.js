@@ -11,7 +11,12 @@
  *   GET  /healthz                — unauthenticated database-backed host probe
  *   GET  /api/health              — config sanity check for the UI
  *   GET  /api/users               — safe Projectworks user picker data
- *   GET  /api/grid?start&end      — { rows, netRows, supplierLines, meta }
+ *   GET  /api/offices             — the tenant's organisations (offices), cached
+ *   GET  /api/grid?start&end[&includeArchived=1][&office=<OfficeID>|all][&fresh=1]
+ *                                 — { rows, netRows, supplierLines, meta }
+ *                                   Archived projects are excluded and the
+ *                                   office filter applied server-side, before
+ *                                   any row is built or sent.
  *                                   netRows is the read-only Net position view:
  *                                   one row per project, planned invoicing minus
  *                                   subconsultant fees, per month.
@@ -53,38 +58,37 @@ const {
   aggregateForecasts,
   aggregateInvoiceFees,
   buildNetRows,
-  collectPages,
   compareTenantOfficeNames,
   firstValue,
+  isArchivedProject,
   isMonth,
   moduleMonthTotals,
+  parseList,
+  resolveExpenseStatusFilter,
   resolveModuleCustomFields,
 } = require('./app-logic');
+const { createProjectworksClient } = require('./pw-client');
 
 const BASE_URL = (process.env.PW_BASE_URL || '').replace(/\/+$/, '');
 const APP_BASE_URL = (process.env.PW_APP_BASE_URL || '').replace(/\/+$/, '');
 const AUTH_MODE = (process.env.AUTH_MODE || '').toLowerCase();
-const TENANT_LOCK_NAMES = (process.env.PW_TENANT_LOCK || '')
-  .split(',')
-  .map((name) => name.trim().replace(/\s+/g, ' '))
-  .filter(Boolean);
+const TENANT_LOCK_NAMES = parseList(process.env.PW_TENANT_LOCK);
 const TENANT_LOCK = TENANT_LOCK_NAMES.join(', ');
 const ALLOW_WRITES = process.env.ALLOW_WRITES === 'true';
 const STORAGE_CONFIG = readStorageConfig();
 const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === 'true';
 const SEED_PATH = path.join(__dirname, 'seed.json');
-const STATUS_CODES = (process.env.INVOICE_STATUS_CODES || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-const EXPENSE_STATUS_CODES = (process.env.EXPENSE_STATUS_CODES || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-const MODULE_CUSTOM_FIELD_LABELS = (process.env.MODULE_CUSTOM_FIELD_LABELS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+// Every list variable is comma-separated with surrounding whitespace trimmed,
+// so "Stage No, Risk Status , Des / Del" and "Stage No,Risk Status,Des / Del"
+// read identically.
+const STATUS_CODES = parseList(process.env.INVOICE_STATUS_CODES);
+const EXPENSE_STATUS_CODES = parseList(process.env.EXPENSE_STATUS_CODES);
+// Names may be given instead of IDs; see resolveExpenseStatusFilter.
+const EXPENSE_STATUS_FILTER = resolveExpenseStatusFilter(EXPENSE_STATUS_CODES);
+const MODULE_CUSTOM_FIELD_LABELS = parseList(process.env.MODULE_CUSTOM_FIELD_LABELS);
+// Project workflow statuses that mean "archived". Optional; SJB archives
+// through the "Archived" status rather than IsActive=false.
+const ARCHIVED_PROJECT_STATUSES = parseList(process.env.ARCHIVED_PROJECT_STATUSES || 'Archived');
 const MODULE_CUSTOM_FIELD_KEYS = ['stageNumber', 'riskStatus', 'fixedHourly'];
 const MODULE_CUSTOM_FIELDS = MODULE_CUSTOM_FIELD_KEYS.map((key, index) => ({
   key,
@@ -240,47 +244,112 @@ function requireBasicAuth(req, res, next) {
 // retained solely as the source for the one-time migration.
 
 // ---- Projectworks proxy ----------------------------------------------------
-// 1000 is the largest page the Open API honours and is required, not merely
-// faster: a copy-of-live tenant returns ~30,000 Modules, which overran the
-// previous 200 x 100 = 20,000 ceiling and failed every grid load outright.
-const PAGE_SIZE = 1000;
-const MAX_PAGES = 100; // hard stop: 100,000 records per collection
+// Every collection is read through pw-client, which takes the page count from
+// the API's x-page-count header and checks the result against x-total-count.
+// 1000 is the largest page the Open API honours (it silently caps larger
+// requests), and module pages are fetched six at a time.
+const pw = createProjectworksClient({
+  baseUrl: BASE_URL,
+  authHeaders,
+  timeoutMs: PW_REQUEST_TIMEOUT_MS,
+  pageSize: 1000,
+  pageConcurrency: 6,
+  maxConcurrent: 12,
+});
 const USER_PAGE_SIZE = 500;
 const USER_CACHE_MS = 5 * 60 * 1000;
 let usersCache = { at: 0, users: [], byID: new Map() };
 
-async function pwGet(pathname, params = {}) {
-  const url = new URL(BASE_URL + pathname);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
-  }
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: { Accept: 'application/json', ...authHeaders() },
-      signal: AbortSignal.timeout(PW_REQUEST_TIMEOUT_MS),
-    });
-  } catch (err) {
-    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
-    throw new Error(
-      `GET ${pathname} ${timedOut ? `timed out after ${PW_REQUEST_TIMEOUT_MS}ms` : `failed: ${String(err.message || err)}`}`
-    );
-  }
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    const err = new Error(`GET ${pathname} → ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return res.json();
+const pwGet = (pathname, params) => pw.get(pathname, params);
+/** Every record, or an IncompleteCollectionError. Used wherever partial data must stop the action. */
+const pwGetAll = (pathname, params, opts) => pw.getAll(pathname, params, opts);
+
+// ---- reference-data cache --------------------------------------------------
+// Offices, custom-field definitions and projects (which carry the PM, type,
+// status and office names the filters use) change rarely, so a grid load or a
+// filter change does not re-read them. Concurrent callers share one in-flight
+// request instead of each starting their own.
+const REFERENCE_CACHE_MS = 10 * 60 * 1000;
+const PROJECTS_CACHE_MS = 5 * 60 * 1000;
+const referenceCache = new Map();
+
+function cached(key, ttlMs, loader, { force = false } = {}) {
+  const hit = referenceCache.get(key);
+  if (!force && hit && (hit.pending || Date.now() - hit.at < ttlMs)) return hit.promise;
+  const entry = { at: Date.now(), pending: true };
+  entry.promise = Promise.resolve().then(loader).then(
+    (value) => { entry.pending = false; entry.at = Date.now(); return value; },
+    (err) => { if (referenceCache.get(key) === entry) referenceCache.delete(key); throw err; }
+  );
+  referenceCache.set(key, entry);
+  return entry.promise;
 }
 
-/** Page through a collection endpoint until a short page comes back. */
-async function pwGetAll(pathname, params = {}) {
-  return collectPages(
-    (page, pageSize) => pwGet(pathname, { ...params, page, pageSize }),
-    { pageSize: PAGE_SIZE, maxPages: MAX_PAGES, label: `GET ${pathname}` }
-  );
+function primeCache(key, value) {
+  referenceCache.set(key, { at: Date.now(), pending: false, promise: Promise.resolve(value) });
+}
+
+function invalidateCache(prefix) {
+  for (const key of [...referenceCache.keys()]) if (key.startsWith(prefix)) referenceCache.delete(key);
+}
+
+// Only the project fields the app reads; the full record carries every
+// project's Modules and CustomFields, which would hold tens of MB in memory.
+function slimProject(p) {
+  return {
+    ProjectID: firstValue(p, ['ProjectID', 'projectID']),
+    ProjectNumber: firstValue(p, ['ProjectNumber', 'projectNumber']),
+    ProjectName: firstValue(p, ['ProjectName', 'projectName']),
+    OfficeID: firstValue(p, ['OfficeID', 'officeID']),
+    OfficeName: firstValue(p, ['OfficeName', 'officeName']),
+    ProjectManagerName: firstValue(p, ['ProjectManagerName', 'projectManagerName']),
+    ProjectTypeName: firstValue(p, ['ProjectTypeName', 'projectTypeName']),
+    ProjectStatusName: firstValue(p, ['ProjectStatusName', 'projectStatusName']),
+    IsActive: firstValue(p, ['IsActive', 'isActive']),
+    CurrencyID: firstValue(p, ['CurrencyID', 'currencyID']),
+    CurrencyCode: firstValue(p, ['CurrencyCode', 'currencyCode']),
+  };
+}
+
+// Modules come back with their Tasks; the grid never reads them.
+function slimModule(m) {
+  const { Tasks, tasks, ...rest } = m || {};
+  return rest;
+}
+
+const PROJECT_ID_KEYS = ['ProjectID', 'projectID'];
+const MODULE_ID_KEYS = ['ModuleID', 'moduleID'];
+
+async function loadProjectsWithReport() {
+  return pw.getAllWithReport('/api/v1/Projects', {}, { map: slimProject, idKeys: PROJECT_ID_KEYS, label: 'GET /api/v1/Projects' });
+}
+
+/** Projects, cached. A short read is never cached and never used: it throws. */
+function getProjects({ force = false } = {}) {
+  return cached('ref:projects', PROJECTS_CACHE_MS, async () => {
+    const { rows, report } = await loadProjectsWithReport();
+    if (!report.complete) {
+      const err = new Error(`GET /api/v1/Projects is incomplete: fetched ${report.unique} of ${report.total}.`);
+      err.report = report;
+      throw err;
+    }
+    return rows;
+  }, { force });
+}
+
+function getOffices() {
+  return cached('ref:offices', REFERENCE_CACHE_MS, async () => {
+    // /Offices takes no pageSize and returns no pagination headers.
+    const rows = await pwGetAll('/api/v1/Offices', {}, { noPageSize: true, idKeys: ['OfficeID', 'officeID'] });
+    return rows
+      .map((o) => ({
+        id: String(firstValue(o, ['OfficeID', 'officeID']) ?? ''),
+        name: String(firstValue(o, ['Name', 'name']) || '').trim(),
+        isActive: firstValue(o, ['IsActive', 'isActive']) !== false,
+      }))
+      .filter((o) => o.id && o.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  });
 }
 
 function collectionFromResponse(payload) {
@@ -330,9 +399,10 @@ async function loadModuleCustomFieldDefinitions() {
   }
 
   const scope = entityTypeID ? { EntityTypeID: entityTypeID } : {};
+  const fieldIDKeys = ['FieldID', 'fieldID'];
   const [rawDefinitions, ...labelGroups] = await Promise.all([
-    pwGetAll('/api/v1/CustomFields', scope),
-    ...MODULE_CUSTOM_FIELDS.map((field) => pwGetAll('/api/v1/CustomFields', { ...scope, Label: field.label })),
+    pwGetAll('/api/v1/CustomFields', scope, { idKeys: fieldIDKeys }),
+    ...MODULE_CUSTOM_FIELDS.map((field) => pwGetAll('/api/v1/CustomFields', { ...scope, Label: field.label }, { idKeys: fieldIDKeys })),
   ]);
   const definitions = rawDefinitions.map((definition) => ({
     ...definition,
@@ -414,7 +484,9 @@ function alphanumeric(value) {
  * office on the first page.
  */
 async function resolveTenantOfficeNames() {
-  const projects = await pwGetAll('/api/v1/Projects');
+  // Forced fresh at boot; a short read throws, so the lock never decides on a
+  // partial project list. The result also warms the grid's project cache.
+  const projects = await getProjects({ force: true });
   const names = new Set();
   for (const p of projects) {
     const name = String(firstValue(p, ['OfficeName', 'officeName']) || '').trim();
@@ -597,10 +669,7 @@ async function getProjectworksUsers(force = false) {
   if (!force && usersCache.users.length && Date.now() - usersCache.at < USER_CACHE_MS) {
     return usersCache.users;
   }
-  const out = await collectPages(
-    (page, pageSize) => fetchProjectworksUsers({ page, pageSize }),
-    { pageSize: USER_PAGE_SIZE, maxPages: MAX_PAGES, label: 'GET /api/v1/Users' }
-  );
+  const out = await pwGetAll('/api/v1/Users', {}, { pageSize: USER_PAGE_SIZE, idKeys: ['UserID', 'userID'] });
   const users = out
     .map(normalizeProjectworksUser)
     .filter(Boolean)
@@ -641,23 +710,23 @@ let modulesCache = { at: 0, byID: new Map() };
 function cacheModules(modules) {
   modulesCache = {
     at: Date.now(),
-    byID: new Map(modules.map((m) => [String(firstValue(m, ['ModuleID', 'moduleID'])), m])),
+    byID: new Map(modules.map((m) => [String(firstValue(m, MODULE_ID_KEYS)), m])),
   };
 }
 
 async function getModuleByID(id) {
   const wanted = String(id ?? '').trim();
   if (!wanted) return null;
-  const fresh = modulesCache.byID.size > 0 && Date.now() - modulesCache.at < MODULE_CACHE_MS;
-  if (!fresh) {
-    cacheModules(await pwGetAll('/api/v1/Modules'));
-    return modulesCache.byID.get(wanted) || null;
-  }
-  const hit = modulesCache.byID.get(wanted);
+  const fresh = Date.now() - modulesCache.at < MODULE_CACHE_MS;
+  const hit = fresh ? modulesCache.byID.get(wanted) : null;
   if (hit) return hit;
-  // Fresh cache but a miss: the module may have been created since the pull.
-  cacheModules(await pwGetAll('/api/v1/Modules'));
-  return modulesCache.byID.get(wanted) || null;
+  // One targeted read rather than re-paging all ~28,000 modules for a single
+  // write. The result is checked by ID, so an ignored filter cannot pass off
+  // some other module.
+  const rows = await pwGetAll('/api/v1/Modules', { ModuleID: wanted }, { idKeys: MODULE_ID_KEYS });
+  const module = rows.find((m) => String(firstValue(m, MODULE_ID_KEYS)) === wanted) || null;
+  if (module) modulesCache.byID.set(wanted, slimModule(module));
+  return module;
 }
 
 function httpError(status, message) {
@@ -789,44 +858,96 @@ function monthEndDate(month) {
   return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
 }
 
-/** Build the composed grid: one row per module (stage). */
-async function buildGrid(startMonth, endMonth) {
-  // Consultant Fees to Date is actual pre-tax expense spend through today.
-  // Consultant month cells remain app-side planning values; the actual monthly
-  // buckets are returned separately for reconciliation and future drill-down.
-  const forecastStart = `${startMonth}-01`;
-  const asOfDate = new Date().toISOString().slice(0, 10);
-  const [projects, modules, invoices, forecasts, expenseClaims, customFieldConfig, supplierLines] = await Promise.all([
-    pwGetAll('/api/v1/Projects'),
-    pwGetAll('/api/v1/Modules', { IncludeCustomFields: true }),
-    pwGetAll('/api/v1/Invoices'),
-    pwGetAll('/api/v1/Forecasts', { StartDate: forecastStart, EndDate: monthEndDate(endMonth) }),
-    pwGetAll('/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false }),
-    loadModuleCustomFieldDefinitions(),
-    storage.getSupplierLines(),
-  ]);
+// The transactional sources (modules, invoices, forecasts, expense claims) are
+// held for a minute so that flipping "Show archived" or the organisation
+// filter re-filters on the server without re-reading ~60,000 records. "Load
+// data" passes fresh=1 and bypasses it; a forecast write clears it.
+const GRID_SOURCE_CACHE_MS = 60 * 1000;
+
+function loadGridSources(startMonth, endMonth, { fresh = false } = {}) {
+  return cached(`grid:${startMonth}:${endMonth}`, GRID_SOURCE_CACHE_MS, async () => {
+    const started = Date.now();
+    // Consultant Fees to Date is actual pre-tax expense spend through today.
+    const asOfDate = new Date().toISOString().slice(0, 10);
+    const reports = [];
+    const collect = async (pathname, params, opts) => {
+      const { rows, report } = await pw.getAllWithReport(pathname, params, { label: `GET ${pathname}`, ...opts });
+      reports.push(report);
+      if (!report.complete) {
+        console.error(
+          `DATA INCOMPLETE: ${report.label} fetched ${report.unique} unique of ${report.total} ` +
+          `(x-total-count) across ${report.pages} pages${report.duplicates ? `, ${report.duplicates} duplicates` : ''}.`
+        );
+      }
+      return rows;
+    };
+    const [projects, offices, customFieldConfig, modules, invoices, forecasts, expenseClaims] = await Promise.all([
+      getProjects({ force: fresh }),
+      getOffices(),
+      cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
+      collect('/api/v1/Modules', { IncludeCustomFields: true }, { map: slimModule, idKeys: MODULE_ID_KEYS }),
+      collect('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'] }),
+      collect('/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) }, {}),
+      collect('/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false },
+        { idKeys: ['ExpenseClaimID', 'expenseClaimID'] }),
+    ]);
+    // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
+    cacheModules(modules);
+    return {
+      projects, offices, customFieldConfig, modules, invoices, forecasts, expenseClaims,
+      reports, asOfDate, fetchedAt: Date.now(), fetchMs: Date.now() - started,
+    };
+  }, { force: fresh });
+}
+
+/**
+ * Build the composed grid: one row per module (stage).
+ *
+ * Archived projects (IsActive=false, or an ARCHIVED_PROJECT_STATUSES status)
+ * and projects outside the selected organisation are dropped here, before any
+ * aggregation, custom-field resolution or serialisation — the browser never
+ * receives them.
+ */
+async function buildGrid(startMonth, endMonth, options = {}) {
+  const includeArchived = !!options.includeArchived;
+  const officeID = options.officeID ? String(options.officeID) : '';
+  const requestStarted = Date.now();
+  const sources = await loadGridSources(startMonth, endMonth, { fresh: !!options.fresh });
+  const fromCache = sources.fetchedAt < requestStarted;
+  const buildStarted = Date.now();
+  const { offices, customFieldConfig, invoices, forecasts, expenseClaims, asOfDate } = sources;
   const customFieldDefinitions = customFieldConfig.definitions;
+  const supplierLines = await storage.getSupplierLines();
 
-  // Keeps the IsServices guard on /api/forecast warm off a call the grid makes anyway.
-  cacheModules(modules);
+  const archivedProjectIDs = new Set();
+  const projects = sources.projects.filter((project) => {
+    const id = String(firstValue(project, PROJECT_ID_KEYS));
+    if (isArchivedProject(project, ARCHIVED_PROJECT_STATUSES)) {
+      archivedProjectIDs.add(id);
+      if (!includeArchived) return false;
+    }
+    return !officeID || String(firstValue(project, ['OfficeID', 'officeID'])) === officeID;
+  });
+  const projectById = new Map(projects.map((project) => [String(firstValue(project, PROJECT_ID_KEYS)), project]));
+  // A module whose project is not in the (filtered) project list is dropped
+  // too: an unknown project cannot be shown to be active or in the office.
+  const modules = sources.modules.filter((m) => projectById.has(String(firstValue(m, PROJECT_ID_KEYS))));
 
-  const projectById = new Map(projects.map((project) => [
-    String(firstValue(project, ['ProjectID', 'projectID'])),
-    project,
+  // Aggregations still read every module so the project/currency lookups for
+  // expense validation stay complete; only kept modules become rows.
+  const moduleProject = new Map(sources.modules.map((module) => [
+    String(firstValue(module, MODULE_ID_KEYS)),
+    String(firstValue(module, PROJECT_ID_KEYS)),
   ]));
-  const moduleProject = new Map(modules.map((module) => [
-    String(firstValue(module, ['ModuleID', 'moduleID'])),
-    String(firstValue(module, ['ProjectID', 'projectID'])),
-  ]));
-  const projectCurrency = new Map(projects.map((project) => [
-    String(firstValue(project, ['ProjectID', 'projectID'])),
+  const projectCurrency = new Map(sources.projects.map((project) => [
+    String(firstValue(project, PROJECT_ID_KEYS)),
     firstValue(project, ['CurrencyID', 'currencyID']),
   ]));
   const inWindow = (m) => m >= startMonth && m <= endMonth; // 'YYYY-MM' sorts lexically
 
   const invoiceActuals = aggregateInvoiceFees(invoices, STATUS_CODES);
   const expenseActuals = aggregateExpenseActuals(expenseClaims, {
-    allowedStatusIDs: EXPENSE_STATUS_CODES,
+    statusFilter: EXPENSE_STATUS_FILTER,
     moduleProject,
     projectCurrency,
     asOfDate,
@@ -879,6 +1000,9 @@ async function buildGrid(startMonth, endMonth) {
       // Originator have no Projectworks equivalent at all and are likely
       // tenant-specific custom fields, so they are not surfaced here.
       projectType: firstValue(p, ['ProjectTypeName', 'projectTypeName']) || '',
+      officeID: firstValue(p, ['OfficeID', 'officeID']) ?? '',
+      officeName: firstValue(p, ['OfficeName', 'officeName']) || '',
+      projectArchived: archivedProjectIDs.has(projectKey),
       stageName: firstValue(m, ['ModuleName', 'moduleName']) || '',
       stageNumber: custom.values.stageNumber || '',
       riskStatus: custom.values.riskStatus || '',
@@ -926,19 +1050,67 @@ async function buildGrid(startMonth, endMonth) {
   const expenseCurrencyIssueCount = [...expenseActuals.currencyIssuesByModule.values()]
     .reduce((sum, issue) => sum + issue.count, 0);
 
+  // Completeness: any collection whose fetched count disagrees with the API's
+  // x-total-count is reported to the UI as a red banner. Nothing is hidden.
+  const integrityErrors = sources.reports
+    .filter((report) => !report.complete)
+    .map((report) => `${report.label}: fetched ${report.unique} of ${report.total} records` +
+      `${report.duplicates ? ` (${report.duplicates} duplicated across pages)` : ''}.`);
+
+  // A configured expense status that is neither an ID nor a known name can only
+  // match a status-name field on the claim. If the claims carry none, that
+  // value matches nothing — said out loud rather than silently showing $0.
+  const claimsHaveStatusNames = expenseClaims.some((claim) =>
+    firstValue(claim, ['ExpenseClaimStatusName', 'expenseClaimStatusName', 'StatusName', 'statusName']) !== undefined);
+  const unresolvedExpenseStatuses = EXPENSE_STATUS_FILTER.resolved
+    .filter((entry) => entry.source === 'name-field' && expenseClaims.length && !claimsHaveStatusNames)
+    .map((entry) => entry.configured);
+  const warnings = [];
+  if (unresolvedExpenseStatuses.length) {
+    warnings.push(
+      `EXPENSE_STATUS_CODES value(s) ${unresolvedExpenseStatuses.map((v) => `"${v}"`).join(', ')} could not be resolved: ` +
+      'Projectworks expense claims carry only a numeric status ID and the API has no status lookup. ' +
+      `Set the numeric ID(s) instead. IDs seen: ${[...expenseActuals.statusesSeen].sort().join(', ') || 'none'}.`
+    );
+  }
+
+  const buildMs = Date.now() - buildStarted;
+  console.log(
+    `grid ${startMonth}..${endMonth}: ${rows.length} of ${sources.modules.length} stages, ${projects.length} of ` +
+    `${sources.projects.length} projects (archived ${includeArchived ? 'shown' : 'excluded'}, office ${officeID || 'all'}); ` +
+    `sources ${fromCache ? 'from cache' : `fetched in ${sources.fetchMs}ms`}, built in ${buildMs}ms`
+  );
+
   return {
     rows,
     netRows: buildNetRows(rows, inWindow),
     supplierLines,
     meta: {
       projects: projects.length,
+      projectsTotal: sources.projects.length,
+      archivedProjects: archivedProjectIDs.size,
+      includeArchived,
+      officeFilter: officeID,
+      offices,
       modules: modules.length,
+      modulesTotal: sources.modules.length,
       invoices: invoices.length,
       expenseClaims: expenseClaims.length,
       forecastEntries: forecasts.length,
+      dataComplete: integrityErrors.length === 0,
+      integrityErrors,
+      warnings,
+      collections: sources.reports.map(({ label, unique, total, pages, verifiedBy, complete }) =>
+        ({ label, fetched: unique, total, pages, verifiedBy, complete })),
+      fetchMs: sources.fetchMs,
+      buildMs,
+      fromCache,
+      fetchedAt: new Date(sources.fetchedAt).toISOString(),
+      archivedProjectStatuses: ARCHIVED_PROJECT_STATUSES,
       invoiceStatusFilter: STATUS_CODES.length ? STATUS_CODES : 'ALL (unfiltered — confirm before demoing revenue figures)',
       invoiceStatusesSeen: [...invoiceActuals.statusesSeen].filter(Boolean),
       expenseStatusFilter: EXPENSE_STATUS_CODES,
+      expenseStatusResolution: EXPENSE_STATUS_FILTER.resolved,
       expenseStatusesSeen: [...expenseActuals.statusesSeen].filter(Boolean),
       expenseActualsAsOf: asOfDate,
       expenseCurrencyIssueCount,
@@ -1033,6 +1205,8 @@ app.get('/api/health', (_req, res) => {
     writesEnabled: ALLOW_WRITES,
     invoiceStatusFilter: STATUS_CODES,
     expenseStatusFilter: EXPENSE_STATUS_CODES,
+    expenseStatusResolution: EXPENSE_STATUS_FILTER.resolved,
+    archivedProjectStatuses: ARCHIVED_PROJECT_STATUSES,
     customFieldLabels: MODULE_CUSTOM_FIELD_LABELS,
     defaultStageSort: DEFAULT_STAGE_SORT,
     requestTimeoutMs: PW_REQUEST_TIMEOUT_MS,
@@ -1051,8 +1225,26 @@ app.get('/api/grid', async (req, res) => {
   if (months < 1 || months > 36) {
     return res.status(400).json({ error: 'forecast range must be between 1 and 36 months' });
   }
+  const flag = (value) => ['1', 'true', 'yes'].includes(String(value || '').toLowerCase());
+  const office = String(req.query.office || '').trim();
+  if (office && office !== 'all' && !/^\d+$/.test(office)) {
+    return res.status(400).json({ error: 'office must be "all" or a numeric OfficeID' });
+  }
   try {
-    res.json(await buildGrid(start, end));
+    res.json(await buildGrid(start, end, {
+      includeArchived: flag(req.query.includeArchived),
+      officeID: office === 'all' ? '' : office,
+      fresh: flag(req.query.fresh),
+    }));
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: String(err.message || err) });
+  }
+});
+
+app.get('/api/offices', async (_req, res) => {
+  try {
+    res.json({ offices: await getOffices() });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: String(err.message || err) });
@@ -1125,6 +1317,8 @@ app.post('/api/forecast', async (req, res) => {
       : '');
   }
   if (!result.ok) return res.status(502).json({ error: result.error });
+  // The cached forecast window no longer matches Projectworks.
+  invalidateCache('grid:');
   res.json({ ok: true });
 });
 
@@ -1301,6 +1495,10 @@ app.get('/api/audit', async (_req, res) => {
     console.log(`  Writes:    ${ALLOW_WRITES ? 'ENABLED' : 'disabled (read-only)'}`);
     console.log(`  Gate:      ${AUTH_DISABLED ? 'DISABLED' : `HTTP Basic (user "${BASIC_AUTH_USER}")`}`);
     console.log(`  Database:  connected (instance "${STORAGE_CONFIG.instanceId}")`);
+    console.log(`  Invoices:  counting status ${STATUS_CODES.map((c) => `"${c}"`).join(', ')}`);
+    console.log(`  Expenses:  counting status ${EXPENSE_STATUS_FILTER.resolved.map((r) =>
+      r.id ? `"${r.configured}" → ID ${r.id}${r.source === 'built-in' ? ' (built-in mapping)' : ''}` : `"${r.configured}" (by name, if claims carry one)`).join(', ')}`);
+    console.log(`  Archived:  projects with IsActive=false or status ${ARCHIVED_PROJECT_STATUSES.map((n) => `"${n}"`).join(', ')} are excluded by default`);
     if (storageStatus.trimmedAuditEntries) {
       console.log(`  Audit:     removed ${storageStatus.trimmedAuditEntries} entries over AUDIT_RETENTION_LIMIT`);
     }
