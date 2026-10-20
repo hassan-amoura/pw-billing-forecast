@@ -12,3 +12,7 @@ data/
 node_modules/
 backups/
 .DS_Store
+
+# Playwright output
+e2e-report/
+e2e-results/
