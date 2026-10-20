@@ -70,10 +70,11 @@ npm start               # http://localhost:3000
 | `INSTANCE_ID` | Required stable deployment/tenant identifier. Every app-side read and write is scoped to it. |
 | `AUDIT_RETENTION_LIMIT` | Optional positive integer. Unset means unlimited. When set, excess old entries are removed at boot; audit append never truncates. |
 | `SEED_DEMO_DATA` | Optional, default off. When exactly `true`, a brand-new, empty app-side dataset for this `INSTANCE_ID` is filled from `seed.json`. Never set it on a customer deployment. |
-| `INVOICE_STATUS_CODES` | Required comma-separated invoice `statusCode` values counted in Gross Fees to Date. Empty stops boot. |
-| `EXPENSE_STATUS_CODES` | Required comma-separated expense `expenseClaimStatusID` values counted in Consultant Fees to Date. Empty stops boot. |
-| `MODULE_CUSTOM_FIELD_LABELS` | Required labels, in order: Stage Number, Risk Status, Fixed / Hourly. Missing tenant fields display blank with a warning. |
-| `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` | Optional override. The app auto-discovers an entity type named Module; set this when the tenant names it differently or discovery is unavailable. Enables the warned ordinal fallback for identityless values. |
+| `INVOICE_STATUS_CODES` | Required comma-separated invoice statuses counted in Gross Fees to Date, matched against `StatusCode` text case-insensitively (or a numeric `StatusID`). SJB: `Finance Approved`. Empty stops boot. |
+| `EXPENSE_STATUS_CODES` | Required comma-separated expense statuses counted in Consultant Fees to Date. Claims carry only a numeric `ExpenseClaimStatusID` and the API has no status lookup, so values are IDs or a known name: `Approved` → ID 4 (SJB's live approved claims all carry 4). An unresolvable name shows a warning naming the IDs seen. The boot log prints the resolution. Empty stops boot. |
+| `ARCHIVED_PROJECT_STATUSES` | Optional, default `Archived`. A project is archived when `IsActive=false` **or** its `ProjectStatusName` is in this list. SJB keeps `IsActive=true` on every project and archives through the `Archived` status. |
+| `MODULE_CUSTOM_FIELD_LABELS` | Required, exactly three labels in order: stage number, risk status, third column. SJB: `Stage No,Risk Status,Des / Del`. Matched by label (never by field ID) against each module's `CustomFields`; the labels are also the column headers. Unset values display blank; an undefined label displays blank with a warning. |
+| `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` | Optional override; leave empty for SJB. Its module fields carry their label, so no entity type is needed, and setting one enables an ordinal fallback that can misplace values. |
 | `DEFAULT_STAGE_SORT` | Required: `stageName` or `stageNumber`. Project name remains the primary default sort. |
 | `PW_APP_BASE_URL` | Optional tenant web app URL for deep links. Empty renders plain text. Its subdomain is checked against the resolved tenant on boot; a mismatch warns loudly, since it means the links point somewhere other than the data. |
 | `PORT` | Optional, default 3000. The server always binds `0.0.0.0`. |
@@ -188,15 +189,80 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   behaviour to confirm once against stage.
 - **Stage Number** comes from the configured module custom field, not
   `externalReference`.
-- **Pagination** is handled automatically (200 per page, hard cap 20,000
-  records per collection). Hitting the cap fails the grid rather than showing
-  incomplete financial totals.
+- **Pagination is verified, never assumed.** The Open API silently caps
+  `pageSize` at 1000 and reports `x-total-count` / `x-page-count` computed on
+  the size it actually served. `pw-client.js` reads the page count from those
+  headers (never stopping on a merely short page), fetches six pages at a
+  time, de-duplicates by ID and compares the result with `x-total-count`. A
+  mismatch is retried once, then logged as `DATA INCOMPLETE` and shown in the
+  UI as a red banner; the tenant lock and the write guard refuse outright.
+  The old build stopped at 200 × 100 = 20,000 modules with only a log line —
+  that is where the "20000 stages" footer came from.
+- **Archived projects never reach the browser.** `/api/grid` drops projects
+  that are archived (see `ARCHIVED_PROJECT_STATUSES`) before building any row.
+  The **Show archived projects** toggle (off by default) re-queries with
+  `includeArchived=1`. On SJB this takes the grid from ~27,800 stages to ~5,900.
+- **Organisation filter.** The Organisation select (All / SJB MEL / SJB SYD)
+  is built from `GET /api/v1/Offices` and applied server-side by `OfficeID`.
+- **Caching.** Offices, custom-field definitions and projects are cached (10
+  and 5 minutes). Modules, invoices, forecasts and expense claims are held for
+  60 seconds so that changing a filter does not re-read ~60,000 records;
+  **Load data** always re-reads them, and a forecast write clears the cache.
 - **Supplier-line writes are checked server-side.** A supplier line cannot be
   added to or edited against a services module even if a caller bypasses the UI.
 - **Stale edits fail visibly.** Gross writes compare the grid's prior value
   with a fresh Projectworks read; supplier-line writes compare under a Postgres
   row lock. A changed value returns 409 and requires a reload instead of silently
   overwriting another browser's edit.
+
+## Tests
+
+```bash
+npm test            # unit tests (node:test), no network
+npm run test:e2e    # Playwright end-to-end, mocked Projectworks API only
+```
+
+The end-to-end suite never contacts a real tenant. `playwright.config.ts`
+starts, in order:
+
+1. a throwaway Postgres (`e2e/support/postgres.js`: `initdb` into a temp dir,
+   deleted on exit — needs the Postgres server binaries on `PATH`, or `PG_BIN`
+   pointing at their directory);
+2. the mock Projectworks API (`e2e/mock-pw/server.js`, port 4310), serving a
+   deterministic fixture tenant (`e2e/mock-pw/fixtures.js`): both SJB offices,
+   active projects plus projects archived by status and by `IsActive=false`,
+   22,000+ modules with and without Stage No, and approved and non-approved
+   invoices and expense claims. Pages are capped at 750 so a client that took a
+   short page as the last one would truncate;
+3. the app with the production variable set and `ALLOW_WRITES=true` (port 4311);
+4. the app with `ALLOW_WRITES=false` (port 4312).
+
+Both app instances run with `cwd=e2e/`, so `dotenv` cannot load a real `.env`,
+and every variable is set explicitly. Browsers: `npx playwright install
+chromium` once if Chromium 1179 is not already cached.
+
+| Spec | Covers |
+|---|---|
+| `auth.spec.ts` | Basic auth gate: 401 without or with wrong credentials, `/healthz` open, app opens with valid credentials |
+| `filters.spec.ts` | No truncation (footer count = fixture active total); archived hidden by default, toggle shows them; organisation All / SJB MEL / SJB SYD |
+| `stage-no.spec.ts` | Stage No populated from the custom field and blank when unset; headers use the configured labels |
+| `status-filters.spec.ts` | Gross Fees to Date counts only Finance Approved invoices; Consultant Fees to Date only Approved (ID 4) claims |
+| `writes.spec.ts` | `ALLOW_WRITES=true`: cells editable, an edit sends `{ moduleID, date: "YYYY-MM-01", amount, comment }` to `POST /Forecasts/Set` and is audited; consultant modules are refused |
+| `readonly.spec.ts` | `ALLOW_WRITES=false`: cells disabled, `/api/forecast` returns 403, nothing reaches the mock |
+| `tenant-lock.spec.ts` | A mismatched `PW_TENANT_LOCK` refuses to start; `SJB SYD` alone refuses a tenant that also has `SJB MEL` projects |
+
+Specs use `data-testid` selectors and web-first assertions only (no fixed
+waits). They run on one worker because they share the mock tenant.
+
+## Tenant probe and benchmark (read-only)
+
+```bash
+PROBE_ENV=.env.prod npm run probe       # completeness, archived/office tallies, lock coverage, custom fields
+PROBE_ENV=.env.prod npm run benchmark   # before/after load time, all-pages vs per-project modules
+```
+
+Both send GET requests only and print counts and field shapes, never
+credentials or client names.
 
 ## Deliberately not in v1
 

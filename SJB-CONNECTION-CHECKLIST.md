@@ -4,6 +4,26 @@ The application code is deliberately shipped with no tenant credentials. Complet
 these steps after creating the dedicated SJB API account. Do not paste secrets into
 Git, Slack, Confluence, or an issue.
 
+## Production go-live (2026-10-20) — read this first
+
+Verified read-only against the SJB tenant on 2026-10-20 (`npm run probe`):
+
+- **`PW_TENANT_LOCK` must be `SJB MEL,SJB SYD`.** Projects sit in both offices
+  (SJB SYD 3,277, SJB MEL 408). `SJB SYD` alone refuses to start with
+  "Unexpected office(s): SJB MEL". The lock logic is unchanged.
+- **Archived = `ProjectStatusName` "Archived"**, not `IsActive=false`: every
+  project returned `IsActive=true`, and 2,766 of 3,685 are status Archived.
+  Excluding them leaves ~5,865 of ~27,779 modules. Both signals are honoured.
+- **`EXPENSE_STATUS_CODES=Approved`** resolves to status ID 4 (no status lookup
+  exists in the API); **`INVOICE_STATUS_CODES=Finance Approved`** matches
+  `StatusCode` text directly.
+- **`MODULE_CUSTOM_FIELD_LABELS=Stage No,Risk Status,Des / Del`**: `Stage No`
+  (FieldID 18) and `Des / Del` (FieldID 3) are on every module; `Risk Status`
+  was not on any non-archived module, so that column shows blank with a notice.
+- Leave `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` empty.
+
+Sections below are the earlier sandbox connection record.
+
 ## 1. Set the SJB-specific environment
 
 Start from `.env.example` locally, or fill the `sync: false` values when creating

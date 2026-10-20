@@ -14,8 +14,10 @@ services:
         value: basic
       - key: AUTH_DISABLED
         value: "false"
+      # Go-live runs with forecast writes enabled. Kept in step with the
+      # dashboard so a Blueprint sync cannot silently turn writes off.
       - key: ALLOW_WRITES
-        value: "false"
+        value: "true"
       - key: SEED_DEMO_DATA
         value: "false"
       - key: DATABASE_SSL_MODE
