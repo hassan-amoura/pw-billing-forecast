@@ -77,3 +77,60 @@ test('transient upstream failures are retried', async () => {
   assert.deepEqual(await client(fetchImpl).getAll('/api/v1/Invoices'), []);
   assert.equal(attempts, 2);
 });
+
+/**
+ * Pages listed in `shifted` are served `by` records early for their first
+ * `times` requests: the page repeats the tail of the page before it and drops
+ * the same number of records from its own end — the way an unstable sort
+ * moves records across offset boundaries under concurrent paging.
+ */
+function shiftingApi(all, { cap = 1000, shifted = [], by = 64, times = 1, calls = [] } = {}) {
+  const served = new Map();
+  return async (url) => {
+    const page = Number(url.searchParams.get('page')) || 1;
+    const size = Math.min(Number(url.searchParams.get('pageSize')) || cap, cap);
+    calls.push(page);
+    const n = (served.get(page) || 0) + 1;
+    served.set(page, n);
+    const offset = shifted.includes(page) && n <= times ? by : 0;
+    const body = all.slice((page - 1) * size - offset, page * size - offset);
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'x-total-count': String(all.length), 'x-page-count': String(Math.ceil(all.length / size)) },
+    });
+  };
+}
+
+test('records that shift between pages are deduplicated and the missing ones re-fetched', async () => {
+  // Two shifted pages × 64 = 128 duplicated and 128 missing, as seen in production.
+  const calls = [];
+  const pw = client(shiftingApi(records(27779), { shifted: [3, 7], calls }));
+  const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
+  assert.equal(report.duplicates, 128);
+  assert.equal(report.unique, 27779);
+  assert.equal(report.complete, true);
+  assert.equal(report.recoveryPasses, 1);
+  assert.equal(rows.length, 27779);
+  assert.equal(new Set(rows.map((r) => r.ModuleID)).size, 27779);
+  // 28 pages, then only the pages around the two shifted boundaries (1–4 and
+  // 5–8) again; no sequential pass.
+  assert.equal(calls.length, 28 + 8);
+});
+
+test('a shift that survives the targeted re-reads is settled by a sequential pass', async () => {
+  const calls = [];
+  const pw = client(shiftingApi(records(5000), { shifted: [3], times: 3, calls }));
+  const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
+  assert.equal(report.complete, true);
+  assert.equal(report.recoveryPasses, 3);
+  assert.equal(rows.length, 5000);
+});
+
+test('a collection still short after recovery is reported incomplete, not padded', async () => {
+  const pw = client(shiftingApi(records(5000), { shifted: [3], times: Infinity }));
+  const { rows, report } = await pw.getAllWithReport('/api/v1/Modules', {}, { idKeys: ['ModuleID'] });
+  assert.equal(report.complete, false);
+  assert.equal(report.unique, 4936);
+  assert.equal(rows.length, 4936);
+  await assert.rejects(pw.getAll('/api/v1/Modules', {}, { idKeys: ['ModuleID'] }), IncompleteCollectionError);
+});

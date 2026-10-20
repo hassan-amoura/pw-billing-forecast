@@ -13,6 +13,11 @@ test.describe('archived projects, organisation filter and completeness', () => {
     await expect(page.getByTestId('meta-stages')).toHaveText(expected.active.stages.toLocaleString('en-US'));
     await expect(page.getByTestId('meta-projects')).toHaveText(expected.activeProjects.toLocaleString('en-US'));
     await expect(page.getByTestId('footer-count')).toHaveText(String(expected.active.gross));
+    // The 500-row render cap is a neutral status-line note, not a banner.
+    expect(expected.active.gross).toBeGreaterThan(500);
+    await expect(page.getByTestId('row-count')).toHaveText(
+      `Showing 500 of ${expected.active.gross.toLocaleString('en-US')} — totals and CSV include all`);
+    await expect(page.locator('.notice', { hasText: 'Showing the first' })).toHaveCount(0);
   });
 
   test('archived projects are hidden by default and the toggle shows them', async ({ page, request }) => {

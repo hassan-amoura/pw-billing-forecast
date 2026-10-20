@@ -6,6 +6,7 @@ const {
   aggregateExpenseActuals,
   aggregateForecasts,
   aggregateInvoiceFees,
+  summarizeInvoiceStatuses,
   buildNetRows,
   compareTenantOfficeNames,
   isArchivedProject,
@@ -219,4 +220,32 @@ test('expense status names resolve to IDs; unknown names match only a status-nam
   const options = { moduleProject: new Map([['10', '100']]), projectCurrency: new Map([['100', 1]]), asOfDate: '2026-09-01' };
   assert.equal(aggregateExpenseActuals(claims, { ...options, statusFilter: byName }).totalsByModule.get('10'), 100);
   assert.equal(aggregateExpenseActuals(claims, { ...options, statusFilter: mixed }).totalsByModule.get('10'), 30);
+});
+
+test('invoice status summary matches INVOICE_STATUS_CODES case- and whitespace-insensitively', () => {
+  const lines = [{ ModuleID: 1, Amount: 100 }];
+  const invoices = [
+    { StatusID: 4, StatusCode: 'FINANCE  APPROVED ', Lines: lines },
+    { StatusID: 4, StatusCode: 'finance approved', Lines: lines },
+    { StatusID: 4, StatusCode: 'Finance Approved', Lines: [] },
+    { StatusID: 1, StatusCode: 'Draft', Lines: lines },
+  ];
+  const summary = summarizeInvoiceStatuses(invoices, [' Finance Approved ']);
+  assert.equal(summary.total, 4);
+  assert.equal(summary.matched, 3);
+  assert.deepEqual(summary.statuses.map(([status]) => status).sort(), [
+    '"Draft" (StatusID 1)', '"FINANCE  APPROVED " (StatusID 4)', '"Finance Approved" (StatusID 4)', '"finance approved" (StatusID 4)',
+  ].sort());
+  // The same rule decides Fees to Date.
+  assert.equal(aggregateInvoiceFees(invoices, [' Finance Approved ']).totalsByModule.get('1'), 200);
+});
+
+test('invoice status summary reports zero matches with the statuses actually seen', () => {
+  const summary = summarizeInvoiceStatuses([
+    { StatusID: 7, StatusCode: 'Sent', Lines: [] },
+    { StatusID: 7, StatusCode: 'Sent', Lines: [] },
+    { StatusID: 8, StatusCode: 'Paid', Lines: [] },
+  ], ['Finance Approved']);
+  assert.equal(summary.matched, 0);
+  assert.deepEqual(summary.statuses, [['"Sent" (StatusID 7)', 2], ['"Paid" (StatusID 8)', 1]]);
 });

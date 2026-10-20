@@ -12,12 +12,18 @@
  * page — an API-side cap below the requested size would make the first page
  * "short" and silently drop everything after it. Page count comes from the
  * headers only, and the result is checked against x-total-count.
+ *
+ * Pages are read concurrently and no sort parameter is sent (none is
+ * verified to exist), so the API's order is not stable and a record can shift
+ * between pages mid-read. Records are deduplicated by ID, and a set that is still short of
+ * x-total-count is topped up by re-reading the affected pages and, failing
+ * that, one sequential pass. Only a set still short after that is incomplete.
  */
 
 class IncompleteCollectionError extends Error {
   constructor(report) {
     super(
-      `${report.label} is incomplete: fetched ${report.fetched} of ${report.total} records` +
+      `${report.label} is incomplete: fetched ${report.unique} unique of ${report.total} records` +
       `${report.duplicates ? ` (${report.duplicates} duplicate IDs across pages)` : ''}. ` +
       'Refusing to treat a partial collection as complete.'
     );
@@ -72,6 +78,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {number} [options.maxConcurrent=12]    requests in flight across the app
  * @param {number} [options.maxPages=200]        hard stop: 200,000 records
  * @param {number} [options.retries=2]
+ * @param {number} [options.recoveryRounds=2]   targeted re-reads of shifted pages
  * @param {Function} [options.fetchImpl=fetch]
  */
 function createProjectworksClient(options) {
@@ -82,6 +89,7 @@ function createProjectworksClient(options) {
   const maxPages = options.maxPages || 200;
   const retries = options.retries ?? 2;
   const retryDelayMs = options.retryDelayMs ?? 400;
+  const recoveryRounds = options.recoveryRounds ?? 2;
   const fetchImpl = options.fetchImpl || fetch;
   const limit = createLimiter(options.maxConcurrent || 12);
 
@@ -140,19 +148,26 @@ function createProjectworksClient(options) {
     const size = opts.pageSize || pageSize;
     const map = opts.map || ((row) => row);
     const pageParams = (page) => ({ ...params, page, ...(opts.noPageSize ? {} : { pageSize: size }) });
+    const state = { total: null };
+    const fetchPage = async (page) => {
+      const res = await request(pathname, pageParams(page));
+      if (!Array.isArray(res.body)) throw new Error(`${label} page ${page} returned a non-array response.`);
+      if (res.total !== null) state.total = state.total === null ? res.total : Math.max(state.total, res.total);
+      return res.body.map(map);
+    };
 
     const first = await request(pathname, pageParams(1));
     if (!Array.isArray(first.body)) {
       throw new Error(`${label} returned a non-array response; check the endpoint shape.`);
     }
     const pages = [first.body.map(map)];
-    let total = first.total;
+    state.total = first.total;
     let pageCount = first.pageCount;
     let verifiedBy = 'headers';
 
-    if (pageCount === null && total !== null) {
+    if (pageCount === null && state.total !== null) {
       // Derive the page count from the size the API actually used.
-      pageCount = total === 0 ? 0 : Math.ceil(total / Math.max(first.body.length, 1));
+      pageCount = state.total === 0 ? 0 : Math.ceil(state.total / Math.max(first.body.length, 1));
     }
 
     if (pageCount !== null) {
@@ -162,13 +177,7 @@ function createProjectworksClient(options) {
       const rest = [];
       for (let page = 2; page <= pageCount; page += 1) rest.push(page);
       const pageLimit = createLimiter(pageConcurrency);
-      const fetched = await Promise.all(rest.map((page) => pageLimit(async () => {
-        const res = await request(pathname, pageParams(page));
-        if (!Array.isArray(res.body)) throw new Error(`${label} page ${page} returned a non-array response.`);
-        if (res.total !== null && total !== null && res.total !== total) total = Math.max(total, res.total);
-        return res.body.map(map);
-      })));
-      pages.push(...fetched);
+      pages.push(...await Promise.all(rest.map((page) => pageLimit(() => fetchPage(page)))));
     } else {
       // No pagination headers at all (e.g. /Offices). Keep paging until an
       // EMPTY page, never stopping on a merely short one, and stop if the API
@@ -186,35 +195,80 @@ function createProjectworksClient(options) {
       }
     }
 
-    const rows = pages.flat();
-    let duplicates = 0;
-    if (opts.idKeys) {
-      const seen = new Set();
+    // Merge every page into one ID-keyed set. Offset paging over an unstable
+    // order lets a record slide across a page boundary between two requests:
+    // it then arrives twice while its neighbour arrives not at all. Duplicates
+    // are dropped here; missing records are recovered below.
+    const byID = new Map();
+    const unkeyed = [];
+    const pagesByID = new Map();
+    const merge = (rows, page) => {
       for (const row of rows) {
-        const id = idOf(row, opts.idKeys);
-        if (id === null) continue;
-        if (seen.has(id)) duplicates += 1;
-        else seen.add(id);
+        const id = opts.idKeys ? idOf(row, opts.idKeys) : null;
+        if (id === null) { unkeyed.push(row); continue; }
+        byID.set(id, row);
+        if (!pagesByID.has(id)) pagesByID.set(id, new Set());
+        pagesByID.get(id).add(page);
       }
+    };
+    pages.forEach((rows, index) => merge(rows, index + 1));
+
+    const fetched = pages.reduce((sum, rows) => sum + rows.length, 0);
+    const duplicates = fetched - unkeyed.length - byID.size;
+    const unique = () => byID.size + unkeyed.length;
+    const short = () => state.total !== null && unique() < state.total;
+    let recoveryPasses = 0;
+
+    // Recovery only works when records can be told apart and pages are known.
+    if (opts.idKeys && pageCount !== null && short()) {
+      const firstPassUnique = unique();
+      // 1. Re-read the pages that served a duplicate, and their neighbours: the
+      //    records that went missing slid across those same boundaries.
+      for (let round = 0; round < recoveryRounds && short(); round += 1) {
+        const affected = new Set();
+        for (const seenOn of pagesByID.values()) {
+          if (seenOn.size < 2) continue;
+          for (const page of seenOn) {
+            for (const p of [page - 1, page, page + 1]) if (p >= 1 && p <= pageCount) affected.add(p);
+          }
+        }
+        if (!affected.size) break;
+        const list = [...affected].sort((a, b) => a - b);
+        const pageLimit = createLimiter(pageConcurrency);
+        const reread = await Promise.all(list.map((page) => pageLimit(() => fetchPage(page))));
+        pagesByID.clear();
+        reread.forEach((rows, i) => merge(rows, list[i]));
+        recoveryPasses += 1;
+      }
+      // 2. Still short: one page at a time, so no two reads overlap in time.
+      if (short()) {
+        for (let page = 1; page <= pageCount; page += 1) merge(await fetchPage(page), page);
+        recoveryPasses += 1;
+      }
+      if (unique() > firstPassUnique) verifiedBy = 'headers+recovered';
     }
-    const unique = rows.length - duplicates;
+
+    const total = state.total;
     const report = {
       label,
-      fetched: rows.length,
-      unique,
+      fetched,
+      unique: unique(),
       duplicates,
+      recoveryPasses,
       total,
       pages: pages.length,
       verifiedBy,
-      complete: total === null ? true : (unique === total && duplicates === 0),
+      complete: total === null ? true : unique() === total,
     };
-    return { rows, report };
+    return { rows: [...byID.values(), ...unkeyed], report };
   }
 
   /**
-   * Every record of a collection, with a completeness report. A mismatch is
-   * retried once (records created mid-read shift page boundaries); a second
-   * mismatch is returned as complete:false for the caller to surface.
+   * Every record of a collection, with a completeness report. Duplicates are
+   * dropped by ID and missing records re-fetched inside fetchCollectionOnce; a
+   * read that is still short is retried once from scratch (records created
+   * mid-read move the total), then returned as complete:false for the caller
+   * to surface.
    */
   async function getAllWithReport(pathname, params = {}, opts = {}) {
     let result = await fetchCollectionOnce(pathname, params, opts);

@@ -66,6 +66,7 @@ const {
   parseList,
   resolveExpenseStatusFilter,
   resolveModuleCustomFields,
+  summarizeInvoiceStatuses,
 } = require('./app-logic');
 const { createProjectworksClient } = require('./pw-client');
 
@@ -391,7 +392,16 @@ async function loadModuleCustomFieldDefinitions() {
         entityTypeID = String(firstValue(moduleType, ['EntityTypeID', 'entityTypeID']) || '');
         entityTypeSource = entityTypeID ? 'discovered' : 'unresolved';
       } else {
-        entityTypeIssue = 'Projectworks did not return an entity type named Module.';
+        // Expected on SJB: stage (module) fields live under "Project Budget".
+        // That type is named here but deliberately not adopted — scoping to it
+        // switches on the ordinal fallback, which misplaces values. Fields are
+        // matched by label instead.
+        const budgetType = types.find((type) =>
+          String(firstValue(type, ['Name', 'name']) || '').trim().toLowerCase() === 'project budget');
+        const budgetTypeID = budgetType ? firstValue(budgetType, ['EntityTypeID', 'entityTypeID']) : undefined;
+        entityTypeIssue = budgetType
+          ? `Stage custom fields are defined on the "Project Budget" entity type (EntityTypeID ${budgetTypeID}); matching them by label.`
+          : 'No "Module" or "Project Budget" custom-field entity type was returned; matching stage custom fields by label.';
       }
     } catch (err) {
       entityTypeIssue = `Module custom-field entity type could not be discovered: ${String(err.message || err)}`;
@@ -873,6 +883,12 @@ function loadGridSources(startMonth, endMonth, { fresh = false } = {}) {
     const collect = async (pathname, params, opts) => {
       const { rows, report } = await pw.getAllWithReport(pathname, params, { label: `GET ${pathname}`, ...opts });
       reports.push(report);
+      if (report.complete && report.recoveryPasses) {
+        console.log(
+          `${report.label}: ${report.duplicates} records shifted between pages; dropped the duplicates and ` +
+          `re-fetched the rest in ${report.recoveryPasses} recovery pass(es) — ${report.unique} of ${report.total}.`
+        );
+      }
       if (!report.complete) {
         console.error(
           `DATA INCOMPLETE: ${report.label} fetched ${report.unique} unique of ${report.total} ` +
@@ -887,7 +903,8 @@ function loadGridSources(startMonth, endMonth, { fresh = false } = {}) {
       cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
       collect('/api/v1/Modules', { IncludeCustomFields: true }, { map: slimModule, idKeys: MODULE_ID_KEYS }),
       collect('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'] }),
-      collect('/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) }, {}),
+      collect('/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) },
+        { idKeys: ['ForecastID', 'forecastID'] }),
       collect('/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false },
         { idKeys: ['ExpenseClaimID', 'expenseClaimID'] }),
     ]);
@@ -898,6 +915,46 @@ function loadGridSources(startMonth, endMonth, { fresh = false } = {}) {
       reports, asOfDate, fetchedAt: Date.now(), fetchMs: Date.now() - started,
     };
   }, { force: fresh });
+}
+
+/**
+ * Startup diagnostics, logged once after the server is listening. Nothing here
+ * reaches the UI: these are the settings an operator corrects in the
+ * environment, so the log is where they belong.
+ *
+ *   - each MODULE_CUSTOM_FIELD_LABELS label: on how many stages it was found
+ *   - invoices fetched, their distinct statuses, and how many match
+ *     INVOICE_STATUS_CODES
+ */
+async function logStartupDiagnostics() {
+  const [customFieldConfig, modules, invoices] = await Promise.all([
+    cached('ref:customFields', REFERENCE_CACHE_MS, loadModuleCustomFieldDefinitions),
+    pw.getAllWithReport('/api/v1/Modules', { IncludeCustomFields: true },
+      { map: slimModule, idKeys: MODULE_ID_KEYS, label: 'GET /api/v1/Modules' }),
+    pw.getAllWithReport('/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'], label: 'GET /api/v1/Invoices' }),
+  ]);
+
+  const found = new Map(MODULE_CUSTOM_FIELDS.map((field) => [field.key, 0]));
+  for (const m of modules.rows) {
+    const custom = resolveModuleCustomFields(m, customFieldConfig.definitions, MODULE_CUSTOM_FIELDS, customFieldConfig.entityTypeID);
+    for (const key of custom.matched) found.set(key, found.get(key) + 1);
+  }
+  console.log(`  Custom fields (${modules.rows.length} stages):`);
+  for (const field of MODULE_CUSTOM_FIELDS) {
+    const n = found.get(field.key);
+    const line = `    "${field.label}": ${n ? `returned on ${n} stages` : 'NOT FOUND on any stage — column will be blank'}`;
+    if (n) console.log(line); else console.warn(line);
+  }
+  if (customFieldConfig.entityTypeIssue) console.log(`    ${customFieldConfig.entityTypeIssue}`);
+
+  // SJB has no invoices until its data migration, so $0 Fees to Date is
+  // expected for now; this line confirms the status match once they arrive.
+  const summary = summarizeInvoiceStatuses(invoices.rows, STATUS_CODES);
+  console.log(
+    `  Invoices:  ${summary.total} fetched${invoices.report.complete ? '' : ` (INCOMPLETE: x-total-count ${invoices.report.total})`}; ` +
+    `statuses seen: ${summary.statuses.map(([status, n]) => `${status} ×${n}`).join(', ') || 'none'}; ` +
+    `${summary.matched} match INVOICE_STATUS_CODES`
+  );
 }
 
 /**
@@ -1037,7 +1094,6 @@ async function buildGrid(startMonth, endMonth, options = {}) {
   if (usedOrdinalCustomFieldMapping) {
     console.warn('Module custom fields were matched by ordinal position. Re-check the mapping after any Projectworks custom-field reorder.');
   }
-  if (customFieldConfig.entityTypeIssue) console.warn(customFieldConfig.entityTypeIssue);
 
   rows.sort((a, b) =>
     String(a.projectName).localeCompare(String(b.projectName), undefined, { numeric: true, sensitivity: 'base' }) ||
@@ -1523,6 +1579,9 @@ app.get('/api/audit', async (_req, res) => {
       console.warn('');
     }
 
+    logStartupDiagnostics().catch((err) => {
+      console.warn(`  Startup diagnostics could not run: ${String(err && err.message ? err.message : err)}`);
+    });
   });
 })().catch((err) => {
   refuseToStart([

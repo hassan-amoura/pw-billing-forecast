@@ -196,16 +196,22 @@ function expenseStatusAllowed(claim, filter) {
 }
 
 /** Invoice statuses match on StatusCode text (case/space-insensitive) or a numeric StatusID. */
-function aggregateInvoiceFees(invoices, allowedStatusCodes) {
+function invoiceStatusMatcher(allowedStatusCodes) {
   const allowed = new Set(allowedStatusCodes.map(normalizedLabel));
+  return (invoice) => !allowed.size ||
+    allowed.has(normalizedLabel(firstValue(invoice, ['StatusCode', 'statusCode']))) ||
+    allowed.has(normalizedLabel(firstValue(invoice, ['StatusID', 'statusID'])));
+}
+
+function aggregateInvoiceFees(invoices, allowedStatusCodes) {
+  const matches = invoiceStatusMatcher(allowedStatusCodes);
   const totalsByModule = new Map();
   const statusesSeen = new Set();
 
   for (const invoice of invoices) {
     const status = firstValue(invoice, ['StatusCode', 'statusCode']);
-    const statusID = firstValue(invoice, ['StatusID', 'statusID']);
     if (status !== undefined && status !== null && String(status).trim()) statusesSeen.add(String(status));
-    if (allowed.size && !allowed.has(normalizedLabel(status)) && !allowed.has(normalizedLabel(statusID))) continue;
+    if (!matches(invoice)) continue;
     for (const line of asArray(firstValue(invoice, ['Lines', 'lines']))) {
       const moduleID = firstValue(line, ['ModuleID', 'moduleID']);
       if (moduleID === undefined || moduleID === null) continue;
@@ -216,6 +222,31 @@ function aggregateInvoiceFees(invoices, allowedStatusCodes) {
   }
 
   return { totalsByModule, statusesSeen };
+}
+
+/**
+ * What Gross Fees to Date will be built from: how many invoices arrived, the
+ * distinct statuses on them (raw, with counts), and how many pass
+ * INVOICE_STATUS_CODES under the same rule aggregateInvoiceFees applies.
+ */
+function summarizeInvoiceStatuses(invoices, allowedStatusCodes) {
+  const matches = invoiceStatusMatcher(allowedStatusCodes);
+  const counts = new Map();
+  let matched = 0;
+  for (const invoice of asArray(invoices)) {
+    const code = firstValue(invoice, ['StatusCode', 'statusCode']);
+    const id = firstValue(invoice, ['StatusID', 'statusID']);
+    const key = code !== undefined && String(code).trim() !== ''
+      ? `"${code}"${id !== undefined ? ` (StatusID ${id})` : ''}`
+      : (id !== undefined ? `StatusID ${id}` : '(no status)');
+    counts.set(key, (counts.get(key) || 0) + 1);
+    if (matches(invoice)) matched += 1;
+  }
+  return {
+    total: asArray(invoices).length,
+    matched,
+    statuses: [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+  };
 }
 
 function aggregateExpenseActuals(expenseClaims, options) {
@@ -410,6 +441,7 @@ module.exports = {
   aggregateExpenseActuals,
   aggregateForecasts,
   aggregateInvoiceFees,
+  summarizeInvoiceStatuses,
   buildNetRows,
   compareTenantOfficeNames,
   expenseStatusAllowed,

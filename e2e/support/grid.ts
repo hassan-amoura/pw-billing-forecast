@@ -23,6 +23,14 @@ export async function mockState(request: APIRequestContext): Promise<MockState> 
   return res.json();
 }
 
+/** Make /Modules serve `pages` shifted by `by` records for their next `times` requests. */
+export async function shiftModulePages(
+  request: APIRequestContext, pages: number[], by: number, times: number | 'always',
+): Promise<void> {
+  const res = await request.post(`${MOCK_URL}/__mock/shift?pages=${pages.join(',')}&by=${by}&times=${times}`);
+  expect(res.ok()).toBeTruthy();
+}
+
 export async function resetMock(request: APIRequestContext): Promise<void> {
   expect((await request.post(`${MOCK_URL}/__mock/reset`)).ok()).toBeTruthy();
 }

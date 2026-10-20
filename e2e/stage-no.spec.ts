@@ -8,7 +8,8 @@ test('Stage No column is filled from the "Stage No" module custom field and blan
   // The header is the tenant's own label from MODULE_CUSTOM_FIELD_LABELS.
   await expect(page.locator('thead th[data-col="stageNumber"]')).toContainText('Stage No');
   await expect(page.locator('thead th[data-col="fixedHourly"]')).toContainText('Des / Del');
-  await expect(page.getByTestId('custom-field-notice')).toBeHidden();
+  // Custom-field problems are logged at server startup, never bannered.
+  await expect(page.getByTestId('custom-field-notice')).toHaveCount(0);
 
   await search(page, 'Alpha Tower');
   await expect(moduleRow(page, named.alphaA).locator('td[data-col="stageNumber"]')).toHaveText('01.10');

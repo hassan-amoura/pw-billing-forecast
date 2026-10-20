@@ -13,7 +13,11 @@
  * treated a short page as the last page would truncate at 750 records.
  *
  * Control endpoints (no auth): GET /__mock/health, GET /__mock/forecast-sets,
- * POST /__mock/reset.
+ * POST /__mock/reset, and POST /__mock/shift?pages=3,7&by=64&times=1, which
+ * makes /Modules serve each listed page `by` records early for its next
+ * `times` requests (times=always: every request). A shifted page repeats the
+ * tail of the page before it and drops as many records from its own end — the
+ * duplicate/missing pattern an unstable sort produces under concurrent paging.
  */
 
 const http = require('http');
@@ -26,9 +30,11 @@ const PAGE_CAP = 750;
 
 let data;
 let forecastSets;
+let shift; // Map page -> remaining shifted responses, plus `by`
 function reset() {
   data = buildFixtures();
   forecastSets = [];
+  shift = { by: 0, pages: new Map() };
 }
 reset();
 
@@ -37,11 +43,16 @@ function send(res, status, body, headers = {}) {
   res.end(JSON.stringify(body));
 }
 
-function paginate(res, rows, query, { headers = true, pageSizeParam = true } = {}) {
+function paginate(res, rows, query, { headers = true, pageSizeParam = true, shifting = false } = {}) {
   const page = Math.max(1, Number(query.get('page')) || 1);
   const requested = pageSizeParam ? Number(query.get('pageSize')) || 100 : 100;
   const size = Math.min(requested, PAGE_CAP);
-  const body = rows.slice((page - 1) * size, page * size);
+  let offset = 0;
+  if (shifting && shift.pages.get(page) > 0) {
+    offset = shift.by;
+    shift.pages.set(page, shift.pages.get(page) - 1);
+  }
+  const body = rows.slice(Math.max(0, (page - 1) * size - offset), page * size - offset);
   const extra = headers
     ? { 'x-total-count': String(rows.length), 'x-page-count': String(Math.ceil(rows.length / size)) }
     : {};
@@ -64,7 +75,7 @@ function handleGet(res, path, q) {
       const rows = data.modules
         .filter((m) => (projectID === null || m.ProjectID === projectID) && (moduleID === null || m.ModuleID === moduleID))
         .map((m) => (withFields ? m : { ...m, CustomFields: [] }));
-      return paginate(res, rows, q);
+      return paginate(res, rows, q, { shifting: true });
     }
     case '/api/v1/Invoices':
       return paginate(res, data.invoices, q);
@@ -117,6 +128,12 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/__mock/health') return send(res, 200, { ok: true, expected: data.expected, named: data.named });
   if (url.pathname === '/__mock/forecast-sets') return send(res, 200, forecastSets);
   if (url.pathname === '/__mock/reset' && req.method === 'POST') { reset(); return send(res, 200, { ok: true }); }
+  if (url.pathname === '/__mock/shift' && req.method === 'POST') {
+    const q = url.searchParams;
+    const times = q.get('times') === 'always' ? Infinity : Number(q.get('times')) || 1;
+    shift = { by: Number(q.get('by')) || 64, pages: new Map(String(q.get('pages') || '').split(',').filter(Boolean).map((p) => [Number(p), times])) };
+    return send(res, 200, { ok: true });
+  }
 
   const expected = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
   if (req.headers.authorization !== expected) return send(res, 401, { error: 'mock: bad credentials' });

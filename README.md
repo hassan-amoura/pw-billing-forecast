@@ -73,7 +73,7 @@ npm start               # http://localhost:3000
 | `INVOICE_STATUS_CODES` | Required comma-separated invoice statuses counted in Gross Fees to Date, matched against `StatusCode` text case-insensitively (or a numeric `StatusID`). SJB: `Finance Approved`. Empty stops boot. |
 | `EXPENSE_STATUS_CODES` | Required comma-separated expense statuses counted in Consultant Fees to Date. Claims carry only a numeric `ExpenseClaimStatusID` and the API has no status lookup, so values are IDs or a known name: `Approved` → ID 4 (SJB's live approved claims all carry 4). An unresolvable name shows a warning naming the IDs seen. The boot log prints the resolution. Empty stops boot. |
 | `ARCHIVED_PROJECT_STATUSES` | Optional, default `Archived`. A project is archived when `IsActive=false` **or** its `ProjectStatusName` is in this list. SJB keeps `IsActive=true` on every project and archives through the `Archived` status. |
-| `MODULE_CUSTOM_FIELD_LABELS` | Required, exactly three labels in order: stage number, risk status, third column. SJB: `Stage No,Risk Status,Des / Del`. Matched by label (never by field ID) against each module's `CustomFields`; the labels are also the column headers. Unset values display blank; an undefined label displays blank with a warning. |
+| `MODULE_CUSTOM_FIELD_LABELS` | Required, exactly three labels in order: stage number, risk status, third column. SJB: `Stage No,Risk Status,Des / Del`. Matched by label (never by field ID) against each module's `CustomFields`; the labels are also the column headers. Unset values display blank; a label no stage carries displays blank and is logged at startup (no UI banner). |
 | `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` | Optional override; leave empty for SJB. Its module fields carry their label, so no entity type is needed, and setting one enables an ordinal fallback that can misplace values. |
 | `DEFAULT_STAGE_SORT` | Required: `stageName` or `stageNumber`. Project name remains the primary default sort. |
 | `PW_APP_BASE_URL` | Optional tenant web app URL for deep links. Empty renders plain text. Its subdomain is checked against the resolved tenant on boot; a mismatch warns loudly, since it means the links point somewhere other than the data. |
@@ -193,9 +193,14 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   `pageSize` at 1000 and reports `x-total-count` / `x-page-count` computed on
   the size it actually served. `pw-client.js` reads the page count from those
   headers (never stopping on a merely short page), fetches six pages at a
-  time, de-duplicates by ID and compares the result with `x-total-count`. A
-  mismatch is retried once, then logged as `DATA INCOMPLETE` and shown in the
-  UI as a red banner; the tenant lock and the write guard refuse outright.
+  time, de-duplicates by ID and compares the result with `x-total-count`. No
+  sort parameter is sent (none is verified to exist), so records can shift
+  between pages mid-read — production saw 128 duplicated and 128 missing of
+  27,779. A short set is topped up by re-reading the pages around each
+  duplicate (two rounds), then by one sequential pass; if still short the
+  whole read is retried once, and only then logged as `DATA INCOMPLETE` and
+  shown in the UI as a red banner. The tenant lock and the write guard refuse
+  outright.
   The old build stopped at 200 × 100 = 20,000 modules with only a log line —
   that is where the "20000 stages" footer came from.
 - **Archived projects never reach the browser.** `/api/grid` drops projects
@@ -244,7 +249,8 @@ chromium` once if Chromium 1179 is not already cached.
 | Spec | Covers |
 |---|---|
 | `auth.spec.ts` | Basic auth gate: 401 without or with wrong credentials, `/healthz` open, app opens with valid credentials |
-| `filters.spec.ts` | No truncation (footer count = fixture active total); archived hidden by default, toggle shows them; organisation All / SJB MEL / SJB SYD |
+| `pagination.spec.ts` | Records shifting between pages mid-read (128 duplicated / 128 missing, as in production) are deduplicated and re-fetched with no banner; a shift that never settles still shows DATA INCOMPLETE |
+| `filters.spec.ts` | No truncation (footer count = fixture active total); 500-row cap shown as a neutral status-line note; archived hidden by default, toggle shows them; organisation All / SJB MEL / SJB SYD |
 | `stage-no.spec.ts` | Stage No populated from the custom field and blank when unset; headers use the configured labels |
 | `status-filters.spec.ts` | Gross Fees to Date counts only Finance Approved invoices; Consultant Fees to Date only Approved (ID 4) claims |
 | `writes.spec.ts` | `ALLOW_WRITES=true`: cells editable, an edit sends `{ moduleID, date: "YYYY-MM-01", amount, comment }` to `POST /Forecasts/Set` and is audited; consultant modules are refused |
