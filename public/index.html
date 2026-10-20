@@ -142,6 +142,11 @@
     font-size:12.5px;padding:8px 20px;background:#FFF8E7;border-bottom:1px solid #F0E3BC;color:#6B5A1E;
   }
   .notice.plan{background:#F1F5FF;border-bottom-color:#CBD8F5;color:#2B3F6B}
+  .notice.error{background:#FBE9E7;border-bottom-color:#F0BDB6;color:#7A221A}
+  .archtag{
+    font:600 9px var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 4px;margin-left:6px;
+  }
   .notice.hidden,.hidden{display:none}
   .toast{
     position:fixed;bottom:18px;right:18px;max-width:420px;z-index:50;
@@ -296,12 +301,12 @@
   <div class="spacer"></div>
   <div class="who">
     <label for="u-select">User</label>
-    <select id="u-select"><option value="">Loading users...</option></select>
+    <select id="u-select" data-testid="user-select"><option value="">Loading users...</option></select>
   </div>
   <div class="chip tenant" id="chip-env" title="Connecting to the Projectworks Open API…">
     <span class="tlabel">Tenant</span><span class="tname" id="chip-tenant">connecting…</span>
   </div>
-  <div class="chip" id="chip-writes">writes: —</div>
+  <div class="chip" id="chip-writes" data-testid="writes-chip">writes: —</div>
   <div class="chip sync" id="chip-sync">synced —</div>
 </header>
 
@@ -320,11 +325,15 @@
   </div>
   <div class="field">
     <label for="f-pm">Project manager</label>
-    <select id="f-pm"><option value="">All PMs</option></select>
+    <select id="f-pm" data-testid="filter-pm"><option value="">All PMs</option></select>
   </div>
   <div class="field">
     <label for="f-type" title="Approximates BQE/Deltek's Class filter using Project Type — not a literal field match.">Project type</label>
-    <select id="f-type"><option value="">All types</option></select>
+    <select id="f-type" data-testid="filter-project-type"><option value="">All types</option></select>
+  </div>
+  <div class="field">
+    <label for="f-office" title="Organisation (Projectworks office). Applied on the server.">Organisation</label>
+    <select id="f-office" data-testid="filter-office"><option value="all">All organisations</option></select>
   </div>
   <div class="field hidden" id="f-gl-w">
     <label for="f-gl">Consultant GL type</label>
@@ -332,26 +341,30 @@
   </div>
   <div class="field">
     <label for="f-q">Search</label>
-    <input type="search" id="f-q" placeholder="Project or stage">
+    <input type="search" id="f-q" data-testid="filter-search" placeholder="Project or stage">
   </div>
   <div class="checks">
-    <label><input type="checkbox" id="f-inactive"> Show inactive stages</label>
+    <label title="Archived projects are excluded on the server unless this is ticked."><input type="checkbox" id="f-archived" data-testid="toggle-archived"> Show archived projects</label>
+    <label><input type="checkbox" id="f-inactive" data-testid="toggle-inactive"> Show inactive stages</label>
     <label id="f-hidezero-w"><input type="checkbox" id="f-hidezero"> Hide $0 fee stages</label>
     <label id="f-noforecast-w"><input type="checkbox" id="f-noforecast" title="Stages with fee remaining but no forecast entries in the selected range."> Remaining fees &amp; no forecast</label>
   </div>
   <div class="spacer"></div>
-  <button class="ghost" id="btn-export">Export CSV</button>
-  <button class="primary" id="btn-load">Load data</button>
+  <button class="ghost" id="btn-export" data-testid="export-button">Export CSV</button>
+  <button class="primary" id="btn-load" data-testid="load-button">Load data</button>
 </div>
 
 <div class="tabs">
-  <button class="tab active" data-tab="gross">Gross fees<span class="n" id="n-gross"></span></button>
-  <button class="tab" data-tab="consultant">Consultant fees<span class="n" id="n-consultant"></span></button>
-  <button class="tab" data-tab="net">Net position<span class="n" id="n-net"></span></button>
-  <button class="tab" data-tab="audit">Audit</button>
+  <button class="tab active" data-tab="gross" data-testid="tab-gross">Gross fees<span class="n" id="n-gross"></span></button>
+  <button class="tab" data-tab="consultant" data-testid="tab-consultant">Consultant fees<span class="n" id="n-consultant"></span></button>
+  <button class="tab" data-tab="net" data-testid="tab-net">Net position<span class="n" id="n-net"></span></button>
+  <button class="tab" data-tab="audit" data-testid="tab-audit">Audit</button>
 </div>
 
-<div class="notice hidden" id="notice-readonly">
+<div class="notice error hidden" id="notice-load-error" data-testid="load-error" role="alert"></div>
+<div class="notice error hidden" id="notice-integrity" data-testid="integrity-banner" role="alert"></div>
+<div class="notice hidden" id="notice-warnings" data-testid="warning-banner"></div>
+<div class="notice hidden" id="notice-readonly" data-testid="readonly-notice">
   Read-only mode: forecast edits are disabled on this server (ALLOW_WRITES=false).
 </div>
 <div class="notice plan hidden" id="notice-consultant">
@@ -372,12 +385,12 @@
   trusting or demoing these revenue figures.
 </div>
 <div class="notice hidden" id="notice-expense"></div>
-<div class="notice hidden" id="notice-custom-fields"></div>
+<div class="notice hidden" id="notice-custom-fields" data-testid="custom-field-notice"></div>
 <div class="notice hidden" id="notice-rowcap"></div>
 
 <div class="gridwrap" id="gridwrap">
   <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks.</div>
-  <table id="grid" class="hidden">
+  <table id="grid" class="hidden" data-testid="grid">
     <thead><tr id="head"></tr></thead>
     <tbody id="body"></tbody>
     <tfoot><tr id="foot"></tr></tfoot>
@@ -398,8 +411,8 @@
 </div>
 
 <div class="statusline">
-  <span id="s-rows">0 rows</span>
-  <span id="s-meta"></span>
+  <span id="s-rows" data-testid="row-count">0 rows</span>
+  <span id="s-meta" data-testid="load-meta"></span>
   <span class="spacer"></span>
   <span id="s-host"></span>
 </div>
@@ -458,6 +471,8 @@
     appBase: '',    // PW_APP_BASE_URL from /api/health; '' = render plain text, no links
     currencyCodes: [],
     defaultCurrency: '',
+    customFieldLabels: ['Stage Number', 'Risk Status', 'Fixed / Hourly'], // MODULE_CUSTOM_FIELD_LABELS
+    loadSeq: 0,       // ignores a slower, superseded /api/grid response
     sort: { key: null, dir: null }, // dir: 'asc', 'desc', or null
     cols: [],       // ordered column defs for the current render
     viewRows: [],   // filtered rows backing the current tbody (data-row indexes point here)
@@ -710,12 +725,42 @@
     $('chip-writes').textContent = 'writes: ' + (state.writes ? 'on' : 'off');
     if (state.writes) $('chip-writes').classList.add('on');
     $('notice-readonly').classList.toggle('hidden', state.writes);
+    applyCustomFieldLabels(h.customFieldLabels);
     // Raise the unfiltered-fees banner immediately, not only after a data load.
     $('notice-status').classList.toggle('hidden', h.invoiceStatusFiltered !== false);
   }).catch(() => {
     $('chip-tenant').textContent = 'server unreachable';
     $('chip-env').classList.add('bad');
   });
+
+  initOffices();
+
+  /** Organisations come from GET /api/v1/Offices via the server, never a hardcoded list. */
+  async function initOffices() {
+    try {
+      const r = await fetch('/api/offices');
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      renderOfficeOptions(data.offices || []);
+    } catch (e) {
+      toast('Organisation list failed: ' + e.message, true);
+    }
+  }
+
+  function renderOfficeOptions(offices) {
+    const sel = $('f-office');
+    const cur = sel.value || 'all';
+    sel.innerHTML = '<option value="all">All organisations</option>' +
+      offices.filter(o => o.isActive !== false || String(o.id) === cur)
+        .map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
+    sel.value = [...sel.options].some(o => o.value === cur) ? cur : 'all';
+  }
+
+  /** Column headers name the tenant's own custom fields (e.g. "Stage No", "Des / Del"). */
+  function applyCustomFieldLabels(labels) {
+    if (!Array.isArray(labels) || labels.length !== 3) return;
+    state.customFieldLabels = labels.map(String);
+  }
 
   // ---- helpers -------------------------------------------------------
   const moneyFormatters = new Map();
@@ -773,15 +818,27 @@
   function tickSaved() { chipTick('saved'); }
 
   // ---- load ----------------------------------------------------------
-  async function load() {
+  /**
+   * Archived projects and the organisation filter are applied on the server,
+   * so changing either re-queries. "Load data" asks for fresh=1; a filter
+   * change reuses the server's one-minute source cache.
+   */
+  async function load(opts = {}) {
     const start = startPick.value, end = endPick.value;
     if (!start || !end || end < start) { toast('Set a valid forecast range first.', true); return; }
+    const seq = ++state.loadSeq;
     const btn = $('btn-load');
     btn.disabled = true; btn.textContent = 'Loading…';
+    $('grid').setAttribute('aria-busy', 'true');
+    const params = new URLSearchParams({ start, end, office: $('f-office').value || 'all' });
+    if ($('f-archived').checked) params.set('includeArchived', '1');
+    if (opts.fresh) params.set('fresh', '1');
     try {
-      const r = await fetch(`/api/grid?start=${start}&end=${end}`);
+      const r = await fetch(`/api/grid?${params}`);
       const data = await r.json();
+      if (seq !== state.loadSeq) return; // a newer request owns the grid
       if (!r.ok) throw new Error(data.error || r.statusText);
+      $('notice-load-error').classList.add('hidden');
       state.rows = data.rows;
       state.netRows = data.netRows || [];
       state.supplierLines = data.supplierLines || [];
@@ -789,10 +846,30 @@
       state.currencyCodes = data.meta.currencyCodes || [];
       state.defaultCurrency = state.currencyCodes.length === 1 ? state.currencyCodes[0] : '';
       state.loaded = true;
-      $('s-meta').textContent =
-        `${data.meta.projects} projects · ${data.meta.modules} stages · ` +
-        `${data.meta.invoices} invoices · ${data.meta.expenseClaims} expenses · ` +
-        `${data.meta.forecastEntries} forecast entries`;
+      const m = data.meta;
+      const count = (n) => Number(n || 0).toLocaleString('en-US');
+      $('s-meta').innerHTML =
+        `<span data-testid="meta-projects">${count(m.projects)}</span> projects · ` +
+        `<span data-testid="meta-stages">${count(m.modules)}</span> stages` +
+        (m.includeArchived ? '' : ` (${count(m.archivedProjects)} archived projects hidden)`) + ' · ' +
+        `${count(m.invoices)} invoices · ${count(m.expenseClaims)} expenses · ` +
+        `${count(m.forecastEntries)} forecast entries`;
+      $('s-meta').title = `${count(m.modulesTotal)} stages and ${count(m.projectsTotal)} projects in Projectworks, ` +
+        `every page fetched and checked against the API's record counts. ` +
+        (m.fromCache ? 'Served from the one-minute server cache.' : `Fetched in ${(m.fetchMs / 1000).toFixed(1)}s.`);
+      if (Array.isArray(m.offices)) renderOfficeOptions(m.offices);
+      applyCustomFieldLabels(m.customFieldLabels);
+      // Fail loudly: a collection that did not match the API's own count.
+      const integrity = m.integrityErrors || [];
+      $('notice-integrity').classList.toggle('hidden', integrity.length === 0);
+      $('notice-integrity').innerHTML = integrity.length
+        ? '<b>Data is incomplete — do not rely on these totals.</b> ' +
+          'Projectworks reported more records than were received: ' + integrity.map(esc).join(' ') +
+          ' Press Load data to retry.'
+        : '';
+      const warnings = m.warnings || [];
+      $('notice-warnings').classList.toggle('hidden', warnings.length === 0);
+      $('notice-warnings').innerHTML = warnings.map(w => `<div>${esc(w)}</div>`).join('');
       $('notice-status').classList.toggle('hidden',
         !(typeof data.meta.invoiceStatusFilter === 'string')); // string = unfiltered warning
       buildPmFilter();
@@ -817,9 +894,15 @@
       toast('Loaded from Projectworks.');
       tickSync();
     } catch (e) {
+      if (seq !== state.loadSeq) return;
+      $('notice-load-error').textContent = 'Load failed: ' + e.message;
+      $('notice-load-error').classList.remove('hidden');
       toast('Load failed: ' + e.message, true);
     } finally {
-      btn.disabled = false; btn.textContent = 'Load data';
+      if (seq === state.loadSeq) {
+        btn.disabled = false; btn.textContent = 'Load data';
+        $('grid').removeAttribute('aria-busy');
+      }
     }
   }
 
@@ -901,9 +984,9 @@
       { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2', sortable: 'text', sortValue: r => r.projectName },
       { key: 'projectManagerName', label: 'Project manager', text: true, align: 'left', sortable: 'text', sortValue: r => r.projectManagerName },
       { key: 'currencyCode', label: 'Currency', text: true, align: 'left', sortable: 'text', sortValue: r => r.currencyCode },
-      { key: 'stageNumber', label: 'Stage Number', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
-      { key: 'riskStatus', label: 'Risk Status', text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
-      { key: 'fixedHourly', label: 'Fixed / Hourly', text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
+      { key: 'stageNumber', label: state.customFieldLabels[0], text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
+      { key: 'riskStatus', label: state.customFieldLabels[1], text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
+      { key: 'fixedHourly', label: state.customFieldLabels[2], text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
       { key: 'netTotal', label: 'Net total', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.netTotal },
       ...state.months.map(k => ({ key: `month:${k}`, label: monthLabel(k), type: 'money', align: 'right', month: k })),
     ];
@@ -1009,10 +1092,10 @@
       { key: 'projectName', label: 'Project', text: true, align: 'left', sticky: 'stick s2', sortable: 'text', sortValue: r => r.projectName },
       { key: 'projectManagerName', label: 'Project Manager', text: true, align: 'left', sortable: 'text', sortValue: r => r.projectManagerName },
       { key: 'currencyCode', label: 'Currency', text: true, align: 'left', sortable: 'text', sortValue: r => r.currencyCode },
-      { key: 'stageNumber', label: 'Stage Number', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
+      { key: 'stageNumber', label: state.customFieldLabels[0], text: true, align: 'left', sortable: 'text', sortValue: r => r.stageNumber },
       { key: 'stageName', label: 'Stage Name', text: true, align: 'left', sortable: 'text', sortValue: r => r.stageName },
-      { key: 'riskStatus', label: 'Risk Status', text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
-      { key: 'fixedHourly', label: 'Fixed / Hourly', text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
+      { key: 'riskStatus', label: state.customFieldLabels[1], text: true, align: 'left', sortable: 'text', sortValue: r => r.riskStatus },
+      { key: 'fixedHourly', label: state.customFieldLabels[2], text: true, align: 'left', sortable: 'text', sortValue: r => r.fixedHourly },
       ...consultantColumns,
       { key: 'fee', label: feeLabel, type: 'money', align: 'right', sortable: 'number', sortValue: r => r.fee },
       { key: 'feesToDate', label: 'Fees to Date', type: 'money', align: 'right', sortable: 'number', sortValue: r => r.feesToDate },
@@ -1235,7 +1318,8 @@
     }
     if (col.key === 'parentNumber') return `<td ${cellAttrs(col)}>${esc(r.parentNumber)}</td>`;
     if (col.key === 'projectName') {
-      return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
+      const tag = r.projectArchived ? '<span class="archtag" data-testid="archived-tag">Archived</span>' : '';
+      return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}${tag}</td>`;
     }
     if (['projectManagerName', 'currencyCode'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
     if (col.key === 'stageNumber') return `<td ${cellAttrs(col)}>${esc(r.stageNumber)}</td>`;
@@ -1276,7 +1360,7 @@
         return `<td ${cellAttrs(col, ['rolled', ...toneClasses(v)], `data-mid="${r.moduleID}" data-month="${col.month}" title="${title}"`)}>${esc(displayValue(v, col, r.currencyCode))}</td>`;
       }
       const v = r.months[col.month];
-      return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-row="${i}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
+      return `<td ${cellAttrs(col, ['mcell'])}><input inputmode="decimal" data-testid="month-cell" aria-label="${esc(r.stageName)} ${col.month}" data-row="${i}" data-month="${col.month}" style="${inputStyleFor(col)}" value="${v == null ? '' : esc(v)}" ${state.writes ? '' : 'disabled'}></td>`;
     }
     return `<td ${cellAttrs(col)}></td>`;
   }
@@ -1303,7 +1387,7 @@
     const tot = (fn) => rows.reduce((s, r) => s + fn(r), 0);
     let value = '';
     let label = '';
-    if (col.key === 'projectName') label = `Total · ${rows.length} ${state.tab === 'net' ? 'projects' : 'stages'}`;
+    if (col.key === 'projectName') label = `Total · <span data-testid="footer-count">${rows.length}</span> ${state.tab === 'net' ? 'projects' : 'stages'}`;
     if (col.key === 'netTotal') value = tot(r => r.netTotal);
     if (col.key === 'fee') value = tot(r => r.fee);
     if (col.key === 'feesToDate') value = tot(r => r.feesToDate);
@@ -1392,7 +1476,7 @@
           ? `<button class="tw" data-mid="${r.moduleID}" title="Supplier lines">${open ? '▾' : '▸'}</button>`
           : '',
       };
-      let html = '<tr>' + cols.map(col => renderMainCell(col, r, i, rowState)).join('') + '</tr>';
+      let html = `<tr data-testid="grid-row" data-module-id="${r.moduleID}">` + cols.map(col => renderMainCell(col, r, i, rowState)).join('') + '</tr>';
       if (open) {
         html += lines.map(line => '<tr class="subrow">' + cols.map(col => renderSupplierCell(col, line, i)).join('') + '</tr>').join('');
         html += '<tr class="subrow">' + cols.map(col => renderAddSupplierCell(col, r, i)).join('') + '</tr>';
@@ -1646,7 +1730,10 @@
   }
 
   // ---- events --------------------------------------------------------
-  $('btn-load').addEventListener('click', load);
+  $('btn-load').addEventListener('click', () => load({ fresh: true }));
+  ['f-archived', 'f-office'].forEach(id => $(id).addEventListener('change', () => {
+    if (state.loaded) load();
+  }));
   $('btn-export').addEventListener('click', exportCsv);
   $('cm-save').addEventListener('click', saveColumnModal);
   $('cm-cancel').addEventListener('click', closeColumnModal);
