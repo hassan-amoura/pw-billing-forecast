@@ -232,18 +232,24 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   user before editing."), never upstream detail.
 - **Organisation filter.** The Organisation select (All / SJB MEL / SJB SYD)
   is built from `GET /api/v1/Offices` and applied server-side by `OfficeID`.
-- **Snapshots: the grid opens instantly.** The last good read of every
-  source is kept per forecast window, in memory and gzipped in Postgres
-  (`grid_snapshots`), so it survives restarts and deploys. Opening the page
-  serves it straight away, with **Last refreshed hh:mm** in the status line;
-  a window with no snapshot yet starts its first sync on page load. **Load
-  data** refreshes in the background (`POST /api/grid/refresh`, `full=1` to
+- **The grid opens instantly, and the forecast range is cheap.** Two caches,
+  both in memory and gzipped in Postgres (`grid_snapshots`), so they survive
+  restarts and deploys: the **dataset** — active projects, stages, invoices,
+  expense claims and the sync state, one copy whatever the range — and
+  **forecasts per range**. Opening the page serves both straight away, with
+  **Last refreshed hh:mm** (the older of the two) in the status line; with no
+  dataset yet, the page load starts the first sync. Changing **Forecast
+  Start/End** reloads the grid at once from the dataset: a range not seen
+  before costs one `GET /Forecasts`, a range already seen costs nothing — never
+  a project or stage read. **Load data** refreshes the dataset and the shown
+  range's forecasts in the background (`POST /api/grid/refresh`, `full=1` to
   force a full sync) with a progress bar and "Refreshing… 412 of 919
-  projects"; the previous data stays on screen until the new snapshot is
-  swapped in. Filters rebuild rows from the snapshot without reading
-  Projectworks. A forecast write is patched into every snapshot that shows it
-  (and into a refresh in flight); supplier lines are read live from Postgres.
-  Offices and custom-field definitions are cached for 10 minutes.
+  projects"; the cached data stays on screen until the new data is swapped in.
+  Filters rebuild rows from the cache without reading Projectworks. A forecast
+  write is patched into every cached range that shows it (and into a read in
+  flight); supplier lines are read live from Postgres. Offices and
+  custom-field definitions are cached for 10 minutes. The dataset is never
+  pruned; the newest 12 forecast ranges are kept.
 - **Per-phase timings are logged on every refresh**, e.g. `grid refresh
   2026-10..2027-09 (full) in 205.3s: projects 14.1s (919 active of 3,685) ·
   reference 13.5s · modules 205.1s (5,866 stages; 919 project(s) read) ·
@@ -298,6 +304,7 @@ chromium` once if Chromium 1179 is not already cached.
 |---|---|
 | `auth.spec.ts` | Basic auth gate: 401 without or with wrong credentials, `/healthz` open, app opens with valid credentials |
 | `active-only.spec.ts` | A full sync requests modules only for active projects (no bulk read, no archived ProjectID) and no archived project is shown or sent; Load data after it reads only `ModifiedSinceDate` changes and applies an edit and a deletion; a short project read is re-read; 429/500 are retried; an unreadable project keeps its last good stages with no error copy; an incomplete first sync still shows the grid with no error copy |
+| `range.spec.ts` | Changing Forecast Start/End in the pickers re-reads only that range's forecasts (one `/Forecasts` read, no project, stage, invoice or expense read) and a range already seen reads nothing; a restarted server serves a new range from the stored dataset plus one `/Forecasts` read |
 | `refresh.spec.ts` | A full refresh shows "Refreshing… N of M projects" over the grid already on screen; a failed refresh (Projectworks down) keeps the last good data, with only "Last refreshed hh:mm" and no error copy, also after a reload |
 | `snapshot.spec.ts` | Reopening the page shows the last snapshot without Load data, with "Last refreshed"; Load data shows progress while the old grid stays usable; a restarted server serves the snapshot from Postgres |
 | `filters.spec.ts` | No truncation (footer count = fixture active total) and no error copy; 500-row cap shown as a neutral status-line note; organisation All / SJB MEL / SJB SYD |

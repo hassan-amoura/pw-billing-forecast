@@ -219,8 +219,10 @@ function createStorage(config) {
       CREATE INDEX IF NOT EXISTS audit_log_instance_time_idx
       ON audit_log (instance_id, time DESC, id DESC)
     `);
-    // The last complete set of grid sources per forecast window, gzipped JSON.
-    // A cache: always safe to delete, rebuilt by the next refresh.
+    // The grid cache, gzipped JSON: "dataset" (projects, stages, invoices and
+    // expense claims, independent of the forecast range) and one
+    // "forecasts:<start>:<end>" row per range. Always safe to delete; rebuilt
+    // by the next refresh.
     await client.query(`
       CREATE TABLE IF NOT EXISTS grid_snapshots (
         instance_id TEXT NOT NULL,
@@ -678,26 +680,36 @@ function createStorage(config) {
   }
 
   /**
-   * Upsert one window's snapshot. A save never replaces a snapshot fetched
-   * later than its own, so a slow save cannot roll back a newer refresh.
-   * Only the newest `keep` windows are retained.
+   * Upsert one cache entry: "dataset" (the range-independent grid sources) or
+   * "forecasts:<start>:<end>" (one range's forecasts). A save never replaces
+   * an entry fetched later than its own, so a slow save cannot roll back a
+   * newer refresh. The dataset is never pruned; only the newest `keep`
+   * forecast ranges are retained. Saving the dataset also drops the
+   * per-range snapshots an earlier build stored (keys "<start>:<end>").
    */
-  async function saveGridSnapshot(windowKey, fetchedAt, payload, keep = 6) {
+  async function saveGridSnapshot(key, fetchedAt, payload, keep = 12) {
     await pool.query(
       `INSERT INTO grid_snapshots (instance_id, window_key, fetched_at, payload)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (instance_id, window_key) DO UPDATE
          SET fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload, saved_at = now()
          WHERE grid_snapshots.fetched_at <= EXCLUDED.fetched_at`,
-      [config.instanceId, String(windowKey), isoTime(fetchedAt, 'snapshot fetched_at'), payload]
+      [config.instanceId, String(key), isoTime(fetchedAt, 'snapshot fetched_at'), payload]
     );
     await pool.query(
       `DELETE FROM grid_snapshots
-       WHERE instance_id = $1 AND window_key NOT IN (
-         SELECT window_key FROM grid_snapshots WHERE instance_id = $1
+       WHERE instance_id = $1 AND window_key LIKE 'forecasts:%' AND window_key NOT IN (
+         SELECT window_key FROM grid_snapshots WHERE instance_id = $1 AND window_key LIKE 'forecasts:%'
          ORDER BY fetched_at DESC LIMIT $2)`,
       [config.instanceId, keep]
     );
+    if (String(key) === 'dataset') {
+      await pool.query(
+        `DELETE FROM grid_snapshots
+         WHERE instance_id = $1 AND window_key <> 'dataset' AND window_key NOT LIKE 'forecasts:%'`,
+        [config.instanceId]
+      );
+    }
   }
 
   /** { fetchedAt, payload } for one window, or null. */

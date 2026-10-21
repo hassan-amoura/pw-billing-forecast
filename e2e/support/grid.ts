@@ -42,6 +42,24 @@ export async function delayModules(request: APIRequestContext, ms: number): Prom
 
 export interface ModuleRequests {
   modulesPaged: number; modulesByProject: number; modulesByID: number; modulesModifiedSince: number; projectIDs: number[];
+  projects: number; forecasts: number; invoices: number; expenseClaims: number;
+}
+
+/** Choose a month in the Forecast start / end picker, as a user does. */
+export async function pickMonth(page: Page, picker: 'f-start' | 'f-end', month: string): Promise<void> {
+  const [year, m] = month.split('-').map(Number);
+  await page.locator(`#${picker}`).click();
+  const pop = page.locator('.mpick-pop');
+  await pop.locator(`.yr[data-y="${year}"]`).click();
+  await pop.locator(`.mo[data-m="${m}"]`).click();
+  await expect(pop).toHaveCount(0);
+}
+
+/** 'YYYY-MM' this many months from now, local time (the UI's default range starts at offset 0). */
+export function monthFromNow(offset: number): string {
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth() + offset, 15);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 export async function moduleRequests(request: APIRequestContext): Promise<ModuleRequests> {
   return (await request.get(`${MOCK_URL}/__mock/requests`)).json();
@@ -90,13 +108,15 @@ const AUTH = { Authorization: 'Basic ' + Buffer.from(`${GATE.username}:${GATE.pa
  * is incremental once a full sync exists). Returns without waiting unless
  * `wait` is set.
  */
-export async function startFullRefresh(request: APIRequestContext, { wait = true } = {}): Promise<void> {
+export async function startFullRefresh(
+  request: APIRequestContext, { wait = true, appUrl = APP_URL }: { wait?: boolean; appUrl?: string } = {},
+): Promise<void> {
   const { start, end } = defaultWindow();
-  const res = await request.post(`${APP_URL}/api/grid/refresh?start=${start}&end=${end}&full=1`, { headers: AUTH });
+  const res = await request.post(`${appUrl}/api/grid/refresh?start=${start}&end=${end}&full=1`, { headers: AUTH });
   expect(res.ok()).toBeTruthy();
   if (!wait) return;
   await expect.poll(async () =>
-    (await (await request.get(`${APP_URL}/api/grid/refresh?start=${start}&end=${end}`, { headers: AUTH })).json()).status,
+    (await (await request.get(`${appUrl}/api/grid/refresh?start=${start}&end=${end}`, { headers: AUTH })).json()).status,
   { timeout: 60_000 }).toBe('done');
 }
 
@@ -121,10 +141,17 @@ export async function loadGrid(page: Page): Promise<void> {
   await waitForGrid(page);
 }
 
+/**
+ * Wait until no refresh is running and the last load has rendered. Order
+ * matters: a background refresh does not mark the grid busy, and its final
+ * reload marks it busy at the very moment the button returns to "Load data".
+ * Checking "not busy" first could pass mid-refresh and return before the
+ * refreshed data is on screen.
+ */
 export async function waitForGrid(page: Page): Promise<void> {
   await expect(page.getByTestId('grid')).toBeVisible();
-  await expect(page.getByTestId('grid')).not.toHaveAttribute('aria-busy', 'true');
   await expect(page.getByTestId('load-button')).toHaveText('Load data');
+  await expect(page.getByTestId('grid')).not.toHaveAttribute('aria-busy', 'true');
 }
 
 export function moduleRow(page: Page, moduleID: number) {

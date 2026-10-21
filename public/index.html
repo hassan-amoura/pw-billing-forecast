@@ -571,7 +571,8 @@
   const MONTHS_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   let openPicker = null; // at most one popup open at a time
 
-  function createMonthPicker(btnId) {
+  /** `onPick` runs when the user picks a different month (not on programmatic sets). */
+  function createMonthPicker(btnId, onPick = () => {}) {
     const btn = $(btnId);
     const wrap = btn.parentElement;
     let value = ''; // 'YYYY-MM' or ''
@@ -647,12 +648,17 @@
         renderPop();
         (pop.querySelector('.mo.sel') || pop.querySelector('.mo')).focus();
       }));
-      pop.querySelectorAll('.mo').forEach(b => b.addEventListener('click', () => {
-        api.value = `${viewYear}-${String(b.dataset.m).padStart(2, '0')}`;
+      const pick = (v) => {
+        const changed = v !== value;
+        api.value = v;
         close(true);
+        if (changed) onPick(v);
+      };
+      pop.querySelectorAll('.mo').forEach(b => b.addEventListener('click', () => {
+        pick(`${viewYear}-${String(b.dataset.m).padStart(2, '0')}`);
       }));
-      pop.querySelector('[data-act=clear]').addEventListener('click', () => { api.value = ''; close(true); });
-      pop.querySelector('[data-act=now]').addEventListener('click', () => { api.value = ym(new Date()); close(true); });
+      pop.querySelector('[data-act=clear]').addEventListener('click', () => pick(''));
+      pop.querySelector('[data-act=now]').addEventListener('click', () => pick(ym(new Date())));
       pop.addEventListener('keydown', onPopKeys);
       const ys = pop.querySelector('.yr.sel');
       if (ys) ys.scrollIntoView({ block: 'nearest' });
@@ -689,8 +695,15 @@
   // ---- init ----------------------------------------------------------
   const now = new Date();
   const ym = (d) => d.toISOString().slice(0, 7);
-  const startPick = createMonthPicker('f-start');
-  const endPick = createMonthPicker('f-end');
+  // A new range re-reads nothing but that range's forecasts (the server's
+  // project and stage cache is the same for every range), so the grid
+  // follows the pickers straight away; Load data is only for fresh data.
+  const onRangePick = () => {
+    const start = startPick.value, end = endPick.value;
+    if (state.loaded && start && end && end >= start) load();
+  };
+  const startPick = createMonthPicker('f-start', onRangePick);
+  const endPick = createMonthPicker('f-end', onRangePick);
   
   initColumnPrefs();
   initUserPicker();

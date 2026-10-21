@@ -44,6 +44,10 @@ export default defineConfig({
       env: { E2E_PG_PORT: String(PG_PORT), PG_BIN: process.env.PG_BIN ?? '', PATH: process.env.PATH ?? '' },
       reuseExistingServer: false,
       timeout: 60_000,
+      // Stop Postgres cleanly. Killed outright, it leaves its System V shared
+      // memory segment behind; macOS allows 32, so the suite stopped starting
+      // after ~32 runs ("could not create shared memory segment").
+      gracefulShutdown: { signal: 'SIGTERM', timeout: 10_000 },
     },
     {
       command: 'node e2e/mock-pw/server.js',

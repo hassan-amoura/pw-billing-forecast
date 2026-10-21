@@ -916,39 +916,50 @@ function monthEndDate(month) {
   return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
 }
 
-// ---- grid snapshots and background refresh ---------------------------------
-// The grid is served from the last good snapshot of its sources, held in
-// memory and gzipped in Postgres so a restart or deploy does not lose it. Only
-// ACTIVE projects are in a snapshot: archived projects (IsActive=false, or an
-// ARCHIVED_PROJECT_STATUSES status) are dropped as soon as the project list is
-// read, and their modules are never requested.
+// ---- grid cache and background refresh -------------------------------------
+// Two caches, both in memory and gzipped in Postgres (grid_snapshots), so a
+// restart or deploy loses neither:
 //
-// "Load data" refreshes in the background; the previous snapshot stays on
-// screen until the new one is installed. Modules are read one project at a
-// time (fetchModulesByProject). After the first full sync, a refresh reads
-// only the modules changed since the previous one (ModifiedSinceDate) and
-// re-reads in full just the projects whose listed modules no longer match the
-// cache; a full sync runs again every FULL_SYNC_INTERVAL_HOURS.
+//   the DATASET — active projects, their stages, invoices, expense claims and
+//     the sync state. One copy, independent of the forecast range: changing
+//     Forecast Start/End never re-reads it.
+//   FORECASTS per range ("YYYY-MM:YYYY-MM") — the only range-dependent read.
+//     A range not seen before costs one GET /Forecasts; a cached one, nothing.
 //
-// A refresh that cannot read everything never replaces a good snapshot: a
-// project whose read failed keeps its modules from the previous snapshot, and
-// a refresh still incomplete after that is logged and discarded when the
-// window already has a snapshot. Nothing about completeness reaches the UI.
+// Archived projects (IsActive=false, or an ARCHIVED_PROJECT_STATUSES status)
+// are dropped as soon as the project list is read; their modules are never
+// requested. "Load data" refreshes the dataset in the background (and the
+// forecasts of the range on screen); what is cached stays on screen until the
+// new data is installed. Modules are read one project at a time
+// (fetchModulesByProject). After the first full sync a refresh reads only the
+// modules changed since the previous one (ModifiedSinceDate) and re-reads in
+// full just the projects whose listed modules no longer match the cache; a
+// full sync runs again every FULL_SYNC_INTERVAL_HOURS.
 //
-// Writes keep snapshots honest. A forecast write is patched into every
-// in-memory snapshot whose window holds that month and into any refresh in
-// flight; a stored-only snapshot for such a window is dropped. Supplier lines
-// are read from Postgres on every build, so they are never stale.
-const SNAPSHOTS_IN_MEMORY = 2;
+// A refresh that cannot read everything never replaces good data: a project
+// whose read failed keeps its modules from the cached dataset, a collection
+// short of its x-total-count keeps the cached copy, and a dataset still
+// incomplete after that is logged and discarded when one is cached. Nothing
+// about completeness reaches the UI.
+//
+// Writes keep the caches honest. A forecast write is patched into every
+// cached forecast set whose range holds that month and into any read in
+// flight; a stored-only set for such a range is dropped. Supplier lines are
+// read from Postgres on every build, so they are never stale.
+const FORECAST_SETS_IN_MEMORY = 12;
 const SNAPSHOT_PERSIST_DELAY_MS = 2000;
 const FORECAST_PATCH_RETENTION_MS = 60 * 60 * 1000;
+const DATASET_KEY = 'dataset';
+const FORECASTS_PREFIX = 'forecasts:';
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
-const snapshots = new Map();      // windowKey -> sources, least recently used first
-const snapshotLoads = new Map();  // windowKey -> in-flight Postgres restore
-const refreshJobs = new Map();    // windowKey -> latest refresh job, running or finished
-const persistTimers = new Map();  // windowKey -> debounce timer
-const persistChains = new Map();  // windowKey -> last save, so saves never overlap
+let dataset = null;               // the range-independent sources, or null before the first sync
+let datasetLoad = null;           // in-flight Postgres restore of the dataset
+const forecastSets = new Map();   // windowKey -> { startMonth, endMonth, forecasts, complete, fetchMs, fetchedAt }, LRU
+const forecastLoads = new Map();  // windowKey -> in-flight restore or read
+let refreshJob = null;            // the latest dataset refresh, running or finished
+const persistTimers = new Map();  // storage key -> debounce timer
+const persistChains = new Map();  // storage key -> last save, so saves never overlap
 let forecastPatches = [];         // { at, moduleID, month, entries }, newest last
 let sourceDiagnosticsLogged = false;
 
@@ -963,7 +974,7 @@ const REFRESH_PHASES = ['projects', 'reference', 'modules', 'invoices', 'expense
 function createRefreshJob(windowKey) {
   const phases = Object.fromEntries(REFRESH_PHASES.map((name) => [name, { status: 'pending' }]));
   return {
-    windowKey,
+    windowKeys: new Set([windowKey]), // ranges whose forecasts this refresh re-reads
     status: 'running',
     mode: null,
     startedAt: Date.now(),
@@ -992,26 +1003,197 @@ const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
 const count = (n) => Number(n || 0).toLocaleString('en-US');
 const idOf = (record, keys) => String(firstValue(record, keys));
 
-/** The newest snapshot of any window, as the base for an incremental refresh. */
-async function latestSnapshot() {
-  let newest = null;
-  for (const sources of snapshots.values()) if (!newest || sources.fetchedAt > newest.fetchedAt) newest = sources;
-  if (newest) return newest;
+// ---- persistence ----
+
+async function persist(key, value, fetchedAt) {
+  const started = Date.now();
   try {
-    const [windowKey] = await storage.listGridSnapshots();
-    return windowKey ? await getSnapshot(windowKey) : null;
+    const payload = await gzip(Buffer.from(JSON.stringify(value)));
+    await storage.saveGridSnapshot(key, new Date(fetchedAt), payload);
+    console.log(`grid cache "${key}" saved to Postgres (${(payload.length / 1048576).toFixed(1)} MB gzipped) in ${Date.now() - started}ms`);
   } catch (err) {
-    console.error(`stored grid snapshots could not be listed: ${String(err.message || err)}`);
-    return null;
+    console.error(`grid cache "${key}" could not be saved: ${String(err.message || err)}`);
   }
 }
 
+function schedulePersist(key, value, fetchedAt, delayMs = SNAPSHOT_PERSIST_DELAY_MS) {
+  clearTimeout(persistTimers.get(key));
+  persistTimers.set(key, setTimeout(() => {
+    persistTimers.delete(key);
+    const previous = persistChains.get(key) || Promise.resolve();
+    persistChains.set(key, previous.then(() => persist(key, value, fetchedAt)));
+  }, delayMs));
+}
+
+async function restore(key) {
+  const stored = await storage.loadGridSnapshot(key);
+  return stored ? JSON.parse((await gunzip(stored.payload)).toString('utf8')) : null;
+}
+
 /**
- * One read of every grid source, timed per phase. Resolves to the sources
- * with `complete` and `incomplete` (reasons, for the log); it rejects only
- * when a source could not be read at all.
+ * A snapshot written by an earlier build held everything for one range. Its
+ * projects, stages, invoices and claims seed the dataset (archived projects
+ * dropped; no sync state, so the next Load data runs a full sync) and its
+ * forecasts seed that range, so the first page load after a deploy is served
+ * from the cache rather than waiting for a sync.
  */
-async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}) {
+async function restoreLegacySnapshot() {
+  const legacyKey = (await storage.listGridSnapshots()).find((key) => /^\d{4}-\d{2}:\d{4}-\d{2}$/.test(key));
+  if (!legacyKey) return null;
+  const old = await restore(legacyKey);
+  if (!old || !Array.isArray(old.projects) || !Array.isArray(old.modules)) return null;
+  const projects = old.projects.filter((p) => !isArchivedProject(p, ARCHIVED_PROJECT_STATUSES));
+  const active = new Set(projects.map((p) => idOf(p, PROJECT_ID_KEYS)));
+  const modules = old.modules.filter((m) => active.has(idOf(m, PROJECT_ID_KEYS)));
+  const moduleIDs = new Set(modules.map((m) => idOf(m, MODULE_ID_KEYS)));
+  installForecastSet({
+    startMonth: old.startMonth, endMonth: old.endMonth, forecasts: old.forecasts || [],
+    complete: true, fetchMs: 0, fetchedAt: old.fetchedAt,
+  });
+  console.log(`grid cache seeded from the previous build's snapshot ${legacyKey} (fetched ${new Date(old.fetchedAt).toISOString()})`);
+  return {
+    version: 3,
+    projects,
+    projectsTotal: old.projectsTotal || old.projects.length,
+    offices: old.offices,
+    customFieldConfig: old.customFieldConfig,
+    modules,
+    invoices: (old.invoices || []).filter((inv) => active.has(idOf(inv, PROJECT_ID_KEYS))),
+    expenseClaims: (old.expenseClaims || []).filter((claim) => moduleIDs.has(idOf(claim, MODULE_ID_KEYS))),
+    asOfDate: old.asOfDate,
+    complete: true,
+    incomplete: [],
+    sync: null,
+    moduleRead: null,
+    counts: {},
+    timings: old.timings || {},
+    fetchMs: old.fetchMs || 0,
+    fetchedAt: old.fetchedAt,
+  };
+}
+
+/** The dataset from memory, else restored from Postgres, else null. Never reads Projectworks. */
+function getDataset() {
+  if (dataset) return Promise.resolve(dataset);
+  if (!datasetLoad) {
+    datasetLoad = (async () => {
+      const started = Date.now();
+      try {
+        const stored = (await restore(DATASET_KEY)) || (await restoreLegacySnapshot());
+        if (!stored) return null;
+        if (dataset && dataset.fetchedAt >= stored.fetchedAt) return dataset; // a refresh won the race
+        dataset = stored;
+        cacheModules(stored.modules, stored.fetchedAt);
+        console.log(`grid dataset restored from Postgres (fetched ${new Date(stored.fetchedAt).toISOString()}) in ${Date.now() - started}ms`);
+        return dataset;
+      } catch (err) {
+        console.error(`grid dataset could not be restored: ${String(err.message || err)}`);
+        return null;
+      } finally {
+        datasetLoad = null;
+      }
+    })();
+  }
+  return datasetLoad;
+}
+
+function installDataset(next) {
+  dataset = next;
+  // Keeps the IsServices guard on /api/forecast warm; it re-checks a module
+  // directly once the dataset is older than MODULE_CACHE_MS.
+  cacheModules(next.modules, next.fetchedAt);
+  schedulePersist(DATASET_KEY, next, next.fetchedAt, 0);
+}
+
+function installForecastSet(set) {
+  const windowKey = windowKeyOf(set.startMonth, set.endMonth);
+  forecastSets.delete(windowKey);
+  forecastSets.set(windowKey, set);
+  while (forecastSets.size > FORECAST_SETS_IN_MEMORY) forecastSets.delete(forecastSets.keys().next().value);
+  return set;
+}
+
+/** GET /Forecasts for one range: the single range-dependent read. */
+async function readForecastSet(startMonth, endMonth, { job = null, previous = null } = {}) {
+  const started = Date.now();
+  const read = await pw.getAllWithReport('/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) }, {
+    label: 'GET /api/v1/Forecasts',
+    idKeys: ['ForecastID', 'forecastID'],
+    onProgress: job ? ({ pagesDone, pages }) => job.progress('forecasts', { pagesDone, pages }) : undefined,
+  });
+  const fetchMs = Date.now() - started;
+  if (!read.report.complete) {
+    const short = `GET /api/v1/Forecasts ${startMonth}..${endMonth}: fetched ${count(read.report.unique)} of ${count(read.report.total)}`;
+    if (previous) {
+      console.warn(`${short}; keeping the cached forecasts for this range`);
+      return previous;
+    }
+    console.error(`${short}; shown as read (nothing cached for this range)`);
+  }
+  const set = { startMonth, endMonth, forecasts: read.rows, complete: read.report.complete, fetchMs, fetchedAt: Date.now() };
+  applyForecastPatches(set, started);
+  return set;
+}
+
+/**
+ * The forecasts for one range: memory, else Postgres, else — when `read` is
+ * set — one GET /Forecasts. Never touches projects or stages.
+ */
+function getForecastSet(startMonth, endMonth, { read = false } = {}) {
+  const windowKey = windowKeyOf(startMonth, endMonth);
+  const hit = forecastSets.get(windowKey);
+  if (hit) {
+    forecastSets.delete(windowKey);
+    forecastSets.set(windowKey, hit);
+    return Promise.resolve(hit);
+  }
+  const loadKey = `${windowKey}:${read ? 'read' : 'cache'}`;
+  if (!forecastLoads.has(loadKey)) {
+    const load = (async () => {
+      try {
+        const stored = await restore(FORECASTS_PREFIX + windowKey).catch((err) => {
+          console.error(`forecasts ${windowKey} could not be restored: ${String(err.message || err)}`);
+          return null;
+        });
+        if (stored) {
+          applyForecastPatches(stored, stored.fetchedAt);
+          return installForecastSet(stored);
+        }
+        if (!read) return null;
+        const set = await readForecastSet(startMonth, endMonth);
+        console.log(`forecasts ${startMonth}..${endMonth} read for a range change in ${seconds(set.fetchMs)} ` +
+          `(${count(set.forecasts.length)} entries; projects and stages served from the cache)`);
+        installForecastSet(set);
+        schedulePersist(FORECASTS_PREFIX + windowKey, set, set.fetchedAt, 0);
+        return set;
+      } finally {
+        forecastLoads.delete(loadKey);
+      }
+    })();
+    forecastLoads.set(loadKey, load);
+  }
+  return forecastLoads.get(loadKey);
+}
+
+/** What buildGrid reads: the dataset with one range's forecasts. Its age is the older of the two. */
+function composeSources(data, set) {
+  return {
+    ...data,
+    startMonth: set.startMonth,
+    endMonth: set.endMonth,
+    forecasts: set.forecasts,
+    fetchedAt: Math.min(data.fetchedAt, set.fetchedAt),
+    datasetFetchedAt: data.fetchedAt,
+    forecastsFetchedAt: set.fetchedAt,
+  };
+}
+
+/**
+ * One read of the range-independent sources, timed per phase. Resolves with
+ * `complete` and `incomplete` (reasons, for the log); rejects only when a
+ * source could not be read at all.
+ */
+async function fetchDataset(job, { full = false } = {}) {
   const started = Date.now();
   // Consultant Fees to Date is actual pre-tax expense spend through today.
   const asOfDate = new Date().toISOString().slice(0, 10);
@@ -1033,12 +1215,10 @@ async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}
     ...opts,
   }));
 
-  // The previous snapshot of this window is the fallback for anything this
-  // read cannot complete; the newest snapshot of any window is the base for
-  // an incremental module read.
-  const previous = await getSnapshot(windowKeyOf(startMonth, endMonth));
-  const base = full ? null : (previous && previous.sync ? previous : await latestSnapshot());
-  const incremental = !!(base && base.sync && Date.now() - base.sync.fullSyncedAt < FULL_SYNC_INTERVAL_MS);
+  // The cached dataset is the fallback for anything this read cannot
+  // complete, and the base for an incremental module read.
+  const previous = await getDataset();
+  const incremental = !full && !!(previous && previous.sync && Date.now() - previous.sync.fullSyncedAt < FULL_SYNC_INTERVAL_MS);
   job.mode = incremental ? 'incremental' : 'full';
 
   const work = {
@@ -1054,12 +1234,10 @@ async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}
     invoices: collect('invoices', '/api/v1/Invoices', {}, { idKeys: ['InvoiceID', 'invoiceID'] }),
     expenses: collect('expenses', '/api/v1/ExpenseClaims', { EndDate: `${asOfDate}T23:59:59.999Z`, IncludeCustomFields: false },
       { idKeys: ['ExpenseClaimID', 'expenseClaimID'] }),
-    forecasts: collect('forecasts', '/api/v1/Forecasts', { StartDate: `${startMonth}-01`, EndDate: monthEndDate(endMonth) },
-      { idKeys: ['ForecastID', 'forecastID'] }),
   };
   work.modules = phase('modules', async () => {
     const { active } = await work.projects;
-    return readActiveModules(active, incremental ? base : null, previous || base, job);
+    return readActiveModules(active, incremental ? previous : null, previous, job);
   });
   // Every phase is awaited below, but not at the same moment: an early failure
   // in one must not leave a later rejection in another unhandled.
@@ -1071,18 +1249,18 @@ async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}
     incomplete.push(`modules missing on ${moduleRead.unrecovered.length} active project(s) ` +
       `(ProjectID ${moduleRead.unrecovered.map((f) => f.projectID).join(', ')})`);
   }
-  const [[offices, customFieldConfig], invoicesRead, expensesRead, forecastsRead] =
-    await Promise.all([work.reference, work.invoices, work.expenses, work.forecasts]);
+  const [[offices, customFieldConfig], invoicesRead, expensesRead] =
+    await Promise.all([work.reference, work.invoices, work.expenses]);
 
   // Keep only what belongs to an active project. A collection that did not
-  // match its x-total-count falls back to the previous snapshot's copy.
+  // match its x-total-count falls back to the cached copy.
   const activeProjectIDs = new Set(projects.map((p) => idOf(p, PROJECT_ID_KEYS)));
   const activeModuleIDs = new Set(moduleRead.modules.map((m) => idOf(m, MODULE_ID_KEYS)));
   const settle = (name, read, keep, fallback) => {
     if (read.report.complete) return read.rows.filter(keep);
     const short = `${read.report.label}: fetched ${count(read.report.unique)} of ${count(read.report.total)}`;
     if (fallback) {
-      console.warn(`grid refresh: ${short}; keeping the previous snapshot's ${name}`);
+      console.warn(`grid refresh: ${short}; keeping the cached ${name}`);
       return fallback.filter(keep);
     }
     incomplete.push(short);
@@ -1092,21 +1270,16 @@ async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}
     (inv) => activeProjectIDs.has(idOf(inv, PROJECT_ID_KEYS)), previous && previous.invoices);
   const expenseClaims = settle('expense claims', expensesRead,
     (claim) => activeModuleIDs.has(idOf(claim, MODULE_ID_KEYS)), previous && previous.expenseClaims);
-  const forecasts = settle('forecasts', forecastsRead,
-    (f) => activeModuleIDs.has(idOf(f, MODULE_ID_KEYS)), previous && previous.forecasts);
 
   const fetchMs = Date.now() - started;
   return {
-    version: 2,
-    startMonth,
-    endMonth,
+    version: 3,
     projects,
     projectsTotal,
     offices,
     customFieldConfig,
     modules: moduleRead.modules,
     invoices,
-    forecasts,
     expenseClaims,
     asOfDate,
     complete: incomplete.length === 0,
@@ -1114,14 +1287,10 @@ async function fetchGridSources(startMonth, endMonth, job, { full = false } = {}
     sync: {
       mode: job.mode,
       syncedAt: started,
-      fullSyncedAt: incremental ? base.sync.fullSyncedAt : started,
+      fullSyncedAt: job.mode === 'incremental' ? previous.sync.fullSyncedAt : started,
     },
     moduleRead: moduleRead.summary,
-    counts: {
-      invoicesRead: invoicesRead.rows.length,
-      expensesRead: expensesRead.rows.length,
-      forecastsRead: forecastsRead.rows.length,
-    },
+    counts: { invoicesRead: invoicesRead.rows.length, expensesRead: expensesRead.rows.length },
     timings: { ...timings, total: fetchMs },
     fetchMs,
     fetchedAt: Date.now(),
@@ -1204,24 +1373,24 @@ async function readActiveModules(projects, base, fallback, job) {
   return { modules: [...carried, ...read.modules, ...kept], unrecovered, summary };
 }
 
-function patchForecasts(sources, { moduleID, month, entries }) {
+function patchForecasts(set, { moduleID, month, entries }) {
   const sameCell = (forecast) => String(firstValue(forecast, MODULE_ID_KEYS)) === String(moduleID) &&
     String(firstValue(forecast, ['Date', 'date']) || '').slice(0, 7) === month;
-  sources.forecasts = sources.forecasts.filter((forecast) => !sameCell(forecast)).concat(entries);
+  set.forecasts = set.forecasts.filter((forecast) => !sameCell(forecast)).concat(entries);
 }
 
-/** Re-apply the forecast writes made since `since` to a snapshot read before them. */
-function applyForecastPatches(sources, since) {
-  const windowKey = windowKeyOf(sources.startMonth, sources.endMonth);
+/** Re-apply the forecast writes made since `since` to a forecast set read before them. */
+function applyForecastPatches(set, since) {
+  const windowKey = windowKeyOf(set.startMonth, set.endMonth);
   for (const patch of forecastPatches) {
-    if (patch.at >= since && windowHolds(windowKey, patch.month)) patchForecasts(sources, patch);
+    if (patch.at >= since && windowHolds(windowKey, patch.month)) patchForecasts(set, patch);
   }
 }
 
 /**
  * A forecast cell was written to Projectworks. Forecasts/Set replaces the
- * module-month, so the cell's value is now exactly `amount`; every snapshot
- * that shows it is patched rather than re-read.
+ * module-month, so the cell's value is now exactly `amount`; every cached
+ * forecast set that shows it is patched rather than re-read.
  */
 async function recordForecastWrite(moduleID, projectID, month, amount) {
   const now = Date.now();
@@ -1233,154 +1402,127 @@ async function recordForecastWrite(moduleID, projectID, month, amount) {
   };
   forecastPatches = forecastPatches.filter((p) => p.at > now - FORECAST_PATCH_RETENTION_MS).slice(-4999);
   forecastPatches.push(patch);
-  for (const [windowKey, sources] of snapshots) {
+  for (const [windowKey, set] of forecastSets) {
     if (!windowHolds(windowKey, month)) continue;
-    patchForecasts(sources, patch);
-    schedulePersist(windowKey, sources);
+    patchForecasts(set, patch);
+    schedulePersist(FORECASTS_PREFIX + windowKey, set, set.fetchedAt);
   }
-  // A window held only in Postgres is dropped rather than patched; the next
-  // load of it refreshes from Projectworks.
+  // A range held only in Postgres is dropped rather than patched; the next
+  // view of it re-reads its forecasts.
   try {
-    for (const windowKey of await storage.listGridSnapshots()) {
-      if (!snapshots.has(windowKey) && windowHolds(windowKey, month)) await storage.deleteGridSnapshot(windowKey);
+    for (const key of await storage.listGridSnapshots()) {
+      if (!key.startsWith(FORECASTS_PREFIX)) continue;
+      const windowKey = key.slice(FORECASTS_PREFIX.length);
+      if (!forecastSets.has(windowKey) && windowHolds(windowKey, month)) await storage.deleteGridSnapshot(key);
     }
   } catch (err) {
-    console.error(`Stored grid snapshots could not be invalidated after a forecast write: ${String(err.message || err)}`);
+    console.error(`Stored forecasts could not be invalidated after a forecast write: ${String(err.message || err)}`);
   }
-}
-
-function installSnapshot(windowKey, sources) {
-  snapshots.delete(windowKey);
-  snapshots.set(windowKey, sources);
-  while (snapshots.size > SNAPSHOTS_IN_MEMORY) snapshots.delete(snapshots.keys().next().value);
-  // Keeps the IsServices guard on /api/forecast warm; it re-checks a module
-  // directly once the snapshot is older than MODULE_CACHE_MS.
-  cacheModules(sources.modules, sources.fetchedAt);
-}
-
-async function persistSnapshot(windowKey, sources) {
-  const started = Date.now();
-  try {
-    const payload = await gzip(Buffer.from(JSON.stringify(sources)));
-    await storage.saveGridSnapshot(windowKey, new Date(sources.fetchedAt), payload);
-    console.log(`grid snapshot ${windowKey} saved to Postgres (${(payload.length / 1048576).toFixed(1)} MB gzipped) in ${Date.now() - started}ms`);
-  } catch (err) {
-    console.error(`grid snapshot ${windowKey} could not be saved: ${String(err.message || err)}`);
-  }
-}
-
-function schedulePersist(windowKey, sources, delayMs = SNAPSHOT_PERSIST_DELAY_MS) {
-  clearTimeout(persistTimers.get(windowKey));
-  persistTimers.set(windowKey, setTimeout(() => {
-    persistTimers.delete(windowKey);
-    const previous = persistChains.get(windowKey) || Promise.resolve();
-    persistChains.set(windowKey, previous.then(() => persistSnapshot(windowKey, sources)));
-  }, delayMs));
-}
-
-/** The window's snapshot from memory, else restored from Postgres, else null. */
-function getSnapshot(windowKey) {
-  const hit = snapshots.get(windowKey);
-  if (hit) {
-    snapshots.delete(windowKey);
-    snapshots.set(windowKey, hit);
-    return Promise.resolve(hit);
-  }
-  if (!snapshotLoads.has(windowKey)) {
-    const load = (async () => {
-      const started = Date.now();
-      try {
-        const stored = await storage.loadGridSnapshot(windowKey);
-        if (!stored) return null;
-        const sources = JSON.parse((await gunzip(stored.payload)).toString('utf8'));
-        // A refresh may have installed a newer snapshot while this one was read.
-        const current = snapshots.get(windowKey);
-        if (current && current.fetchedAt >= sources.fetchedAt) return current;
-        applyForecastPatches(sources, sources.fetchedAt);
-        installSnapshot(windowKey, sources);
-        console.log(`grid snapshot ${windowKey} restored from Postgres (fetched ${new Date(sources.fetchedAt).toISOString()}) in ${Date.now() - started}ms`);
-        return sources;
-      } catch (err) {
-        console.error(`grid snapshot ${windowKey} could not be restored: ${String(err.message || err)}`);
-        return null;
-      } finally {
-        snapshotLoads.delete(windowKey);
-      }
-    })();
-    snapshotLoads.set(windowKey, load);
-  }
-  return snapshotLoads.get(windowKey);
 }
 
 /**
- * Start the background refresh of one window, or join the one already
- * running. job.promise resolves to the sources now being served for the
- * window (the new ones, or the previous ones when this read was incomplete),
- * or null when there are none; it never rejects. Failures are logged here and
- * nowhere else.
+ * Start the background refresh, or join the one already running (adding this
+ * range to the forecasts it re-reads). job.promise resolves to the dataset now
+ * being served (the new one, or the cached one when this read was incomplete
+ * or failed), or null when there is none; it never rejects. Failures are
+ * logged here and nowhere else.
  */
 function startRefresh(startMonth, endMonth, { full = false } = {}) {
   const windowKey = windowKeyOf(startMonth, endMonth);
-  const running = refreshJobs.get(windowKey);
-  if (running && running.status === 'running') return running;
+  if (refreshJob && refreshJob.status === 'running') {
+    refreshJob.windowKeys.add(windowKey);
+    return refreshJob;
+  }
   const job = createRefreshJob(windowKey);
-  refreshJobs.set(windowKey, job);
+  refreshJob = job;
   const finish = (status) => {
     job.status = status;
     job.finishedAt = Date.now();
   };
-  job.promise = (async () => {
-    const sources = await fetchGridSources(startMonth, endMonth, job, { full });
-    applyForecastPatches(sources, job.startedAt);
 
-    // Build once: times the build phase and proves the snapshot renders.
+  // Forecasts of every range this refresh was asked for, read alongside the
+  // dataset, then once more for any range that joined while it ran. A short
+  // read keeps the cached set; a failed one is logged and keeps it too.
+  const forecastsRead = new Set();
+  let forecastsMs = 0;
+  const readForecasts = async () => {
+    const t = Date.now();
+    job.phase('forecasts', 'running');
+    for (;;) {
+      const pending = [...job.windowKeys].filter((key) => !forecastsRead.has(key));
+      if (!pending.length) break;
+      for (const key of pending) {
+        forecastsRead.add(key);
+        const [start, end] = key.split(':');
+        try {
+          const previous = await getForecastSet(start, end);
+          const set = await readForecastSet(start, end, { job, previous });
+          installForecastSet(set);
+          if (set !== previous) schedulePersist(FORECASTS_PREFIX + key, set, set.fetchedAt, 0);
+        } catch (err) {
+          console.error(`grid refresh: forecasts ${start}..${end} could not be read; keeping any cached: ${String(err.message || err)}`);
+        }
+      }
+    }
+    forecastsMs += Date.now() - t;
+    job.phase('forecasts', 'done', forecastsMs);
+  };
+
+  job.promise = (async () => {
+    const first = readForecasts();
+    const next = await fetchDataset(job, { full });
+    await first;
+    await readForecasts();
+    next.timings.forecasts = forecastsMs;
+
+    // Build once with the range that started the refresh: times the build
+    // phase and proves the data renders.
     const buildStarted = Date.now();
     job.phase('build', 'running');
-    await buildGrid(sources, { logDiagnostics: true });
-    sources.timings.build = Date.now() - buildStarted;
-    job.phase('build', 'done', sources.timings.build);
-    logRefresh(sources, job);
+    const set = (await getForecastSet(startMonth, endMonth)) ||
+      { startMonth, endMonth, forecasts: [], fetchedAt: Date.now() };
+    await buildGrid(composeSources(next, set), { logDiagnostics: true });
+    next.timings.build = Date.now() - buildStarted;
+    job.phase('build', 'done', next.timings.build);
+    logRefresh(next, job, set);
 
-    const current = await getSnapshot(windowKey);
-    if (!sources.complete && current) {
-      for (const reason of sources.incomplete) console.error(`grid refresh ${startMonth}..${endMonth} incomplete: ${reason}`);
-      console.error(`grid refresh ${startMonth}..${endMonth}: kept the previous snapshot (fetched ${new Date(current.fetchedAt).toISOString()})`);
+    const current = await getDataset();
+    if (!next.complete && current) {
+      for (const reason of next.incomplete) console.error(`grid refresh incomplete: ${reason}`);
+      console.error(`grid refresh: kept the cached dataset (fetched ${new Date(current.fetchedAt).toISOString()})`);
       finish('done');
       return current;
     }
-    for (const reason of sources.incomplete) {
-      console.error(`grid refresh ${startMonth}..${endMonth} incomplete, installed (no previous snapshot): ${reason}`);
-    }
-    installSnapshot(windowKey, sources);
-    schedulePersist(windowKey, sources, 0);
+    for (const reason of next.incomplete) console.error(`grid refresh incomplete, installed (nothing cached): ${reason}`);
+    installDataset(next);
     finish('done');
     if (!sourceDiagnosticsLogged) {
       sourceDiagnosticsLogged = true;
-      logSourceDiagnostics(sources);
+      logSourceDiagnostics(next);
     }
-    return sources;
+    return next;
   })().catch(async (err) => {
     job.error = String((err && err.message) || err);
     finish('error');
-    console.error(`grid refresh ${startMonth}..${endMonth} failed after ${seconds(job.finishedAt - job.startedAt)}: ${job.error}`);
-    return getSnapshot(windowKey);
+    console.error(`grid refresh failed after ${seconds(job.finishedAt - job.startedAt)}: ${job.error}`);
+    return getDataset();
   });
   return job;
 }
 
 /** One line per refresh: every phase's time and what it read. */
-function logRefresh(sources, job) {
-  const { timings, moduleRead: mr, counts: c } = sources;
+function logRefresh(data, job, set) {
+  const { timings, moduleRead: mr, counts: c } = data;
   console.log(
-    `grid refresh ${sources.startMonth}..${sources.endMonth} (${job.mode}) in ${seconds(Date.now() - job.startedAt)}: ` +
-    `projects ${seconds(timings.projects)} (${count(sources.projects.length)} active of ${count(sources.projectsTotal)}) · ` +
+    `grid refresh (${job.mode}) in ${seconds(Date.now() - job.startedAt)}: ` +
+    `projects ${seconds(timings.projects)} (${count(data.projects.length)} active of ${count(data.projectsTotal)}) · ` +
     `reference ${seconds(timings.reference)} · ` +
-    `modules ${seconds(timings.modules)} (${count(sources.modules.length)} stages; ${count(mr.projectsRead)} project(s) read` +
+    `modules ${seconds(timings.modules)} (${count(data.modules.length)} stages; ${count(mr.projectsRead)} project(s) read` +
     `${mr.mode === 'incremental' ? `, ${count(mr.changed)} changed, ${count(mr.removed)} removed` : ''}` +
     `${mr.retried ? `, ${count(mr.retried)} re-read` : ''}${mr.failed ? `, ${count(mr.failed)} failed (${count(mr.keptFromCache)} kept from cache)` : ''}) · ` +
-    `invoices ${seconds(timings.invoices)} (${count(sources.invoices.length)} of ${count(c.invoicesRead)} on active projects) · ` +
-    `expenses ${seconds(timings.expenses)} (${count(sources.expenseClaims.length)} of ${count(c.expensesRead)}) · ` +
-    `forecasts ${seconds(timings.forecasts)} (${count(sources.forecasts.length)} of ${count(c.forecastsRead)}) · ` +
+    `invoices ${seconds(timings.invoices)} (${count(data.invoices.length)} of ${count(c.invoicesRead)} on active projects) · ` +
+    `expenses ${seconds(timings.expenses)} (${count(data.expenseClaims.length)} of ${count(c.expensesRead)}) · ` +
+    `forecasts ${seconds(timings.forecasts)} (${[...job.windowKeys].join(', ')}; ${count(set.forecasts.length)} entries for ${set.startMonth}..${set.endMonth}) · ` +
     `build ${seconds(timings.build)}`
   );
 }
@@ -1611,6 +1753,8 @@ async function buildGrid(sources, options = {}) {
       buildMs,
       fromSnapshot,
       fetchedAt: new Date(sources.fetchedAt).toISOString(),
+      datasetFetchedAt: new Date(sources.datasetFetchedAt || sources.fetchedAt).toISOString(),
+      forecastsFetchedAt: new Date(sources.forecastsFetchedAt || sources.fetchedAt).toISOString(),
       snapshotAgeMs,
       refresh: refreshStatus(options.refresh),
       invoiceStatusesSeen: [...invoiceActuals.statusesSeen].filter(Boolean),
@@ -1717,10 +1861,12 @@ function parseWindow(query) {
 }
 
 /**
- * The grid, built from the range's snapshot. With no snapshot yet (or
- * fresh=1) the sources are read in the foreground, joining any refresh already
- * running. ifCached=1 never reads Projectworks: with no snapshot it answers
- * { snapshot: false } — the page-load path, which must be instant.
+ * The grid: the cached dataset (projects, stages, invoices, expense claims —
+ * the same for every range) plus this range's forecasts. A range change
+ * therefore costs at most one GET /Forecasts and never a project or stage
+ * read. Only with no dataset at all (or fresh=1) is the dataset read in the
+ * foreground, joining any refresh already running; ifCached=1 then answers
+ * { snapshot: false } instead, so the page load starts a background sync.
  */
 app.get('/api/grid', async (req, res) => {
   const range = parseWindow(req.query);
@@ -1730,20 +1876,19 @@ app.get('/api/grid', async (req, res) => {
     return res.status(400).json({ error: 'office must be "all" or a numeric OfficeID' });
   }
   try {
-    let sources = flag(req.query.fresh) ? null : await getSnapshot(range.windowKey);
-    const fromSnapshot = !!sources;
-    if (!sources) {
-      if (flag(req.query.ifCached)) {
-        return res.json({ snapshot: false, refresh: refreshStatus(refreshJobs.get(range.windowKey)) });
-      }
-      const job = startRefresh(range.start, range.end);
-      sources = await job.promise;
-      if (!sources) throw new Error(job.error || 'no grid data could be read');
+    let data = flag(req.query.fresh) ? null : await getDataset();
+    const fromSnapshot = !!data;
+    if (!data) {
+      if (flag(req.query.ifCached)) return res.json({ snapshot: false, refresh: refreshStatus(refreshJob) });
+      const job = startRefresh(range.start, range.end, { full: flag(req.query.fresh) });
+      data = await job.promise;
+      if (!data) throw new Error(job.error || 'no grid data could be read');
     }
-    res.json(await buildGrid(sources, {
+    const set = await getForecastSet(range.start, range.end, { read: true });
+    res.json(await buildGrid(composeSources(data, set), {
       officeID: office === 'all' ? '' : office,
       fromSnapshot,
-      refresh: refreshJobs.get(range.windowKey),
+      refresh: refreshJob,
     }));
   } catch (err) {
     // Logged in full here; the browser gets no upstream detail.
@@ -1752,18 +1897,21 @@ app.get('/api/grid', async (req, res) => {
   }
 });
 
-/** "Load data": start (or join) a background refresh of the range. Read-only against Projectworks. */
+/**
+ * "Load data": start (or join) the background refresh of the dataset and of
+ * this range's forecasts. Read-only against Projectworks.
+ */
 app.post('/api/grid/refresh', (req, res) => {
   const range = parseWindow(req.query);
   if (range.error) return res.status(400).json({ error: range.error });
   res.status(202).json(refreshStatus(startRefresh(range.start, range.end, { full: flag(req.query.full) })));
 });
 
-/** Progress of the range's latest refresh: idle, running (per-phase), done or error. */
+/** Progress of the latest refresh: idle, running (per-phase) or done. */
 app.get('/api/grid/refresh', (req, res) => {
   const range = parseWindow(req.query);
   if (range.error) return res.status(400).json({ error: range.error });
-  res.json(refreshStatus(refreshJobs.get(range.windowKey)));
+  res.json(refreshStatus(refreshJob));
 });
 
 app.get('/api/offices', async (_req, res) => {
@@ -2052,12 +2200,12 @@ app.get('/api/audit', async (_req, res) => {
       `incremental refresh, full sync every ${FULL_SYNC_INTERVAL_MS / 3600000}h`);
     console.log('  Diagnostics: logged after the first grid refresh (nothing is read at boot)');
 
-    // Restore the default window's snapshot (current month + 11, as the UI
-    // opens with) from Postgres, so the first page load is served from memory.
-    // No Projectworks call.
+    // Restore the dataset and the default range's forecasts (current month
+    // + 11, as the UI opens with) from Postgres, so the first page load is
+    // served from memory. No Projectworks call.
     const now = new Date();
     const ym = (offset) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 15)).toISOString().slice(0, 7);
-    getSnapshot(windowKeyOf(ym(0), ym(11)));
+    getDataset().then(() => getForecastSet(ym(0), ym(11)));
   });
 })().catch((err) => {
   refuseToStart([

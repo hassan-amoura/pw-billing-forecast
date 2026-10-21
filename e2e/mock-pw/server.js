@@ -33,7 +33,8 @@
  *     project's Modules list, bumping the project's ModifiedDateUTC).
  *   POST /__mock/delay?ms=800 — every /Modules response waits this long.
  *   GET  /__mock/requests — /Modules requests by kind since reset, with every
- *     ProjectID requested.
+ *     ProjectID requested, and how many times /Projects, /Forecasts,
+ *     /Invoices and /ExpenseClaims were read (first-page requests).
  */
 
 const http = require('http');
@@ -62,7 +63,10 @@ function reset() {
   failures = new Map();
   shortReads = new Map();
   outage = false;
-  requests = { modulesPaged: 0, modulesByProject: 0, modulesByID: 0, modulesModifiedSince: 0, projectIDs: [] };
+  requests = {
+    modulesPaged: 0, modulesByProject: 0, modulesByID: 0, modulesModifiedSince: 0, projectIDs: [],
+    projects: 0, forecasts: 0, invoices: 0, expenseClaims: 0,
+  };
 }
 const nowUTC = () => new Date().toISOString().replace('Z', '');
 reset();
@@ -85,6 +89,8 @@ function paginate(res, rows, query, { headers = true, pageSizeParam = true, phan
   send(res, 200, body, extra);
 }
 
+// One collection read = its first page; later pages of the same read are not counted.
+const firstPage = (q) => (Number(q.get('page')) || 1) === 1;
 const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
 const day = (v) => String(v || '').slice(0, 10);
 // ModifiedDateUTC has no zone suffix on the live API; it is UTC.
@@ -98,6 +104,7 @@ const modifiedSince = (q) => {
 function handleGet(res, path, q) {
   switch (path) {
     case '/api/v1/Projects': {
+      if (firstPage(q)) requests.projects += 1;
       const id = num(q.get('ProjectID'));
       const changed = modifiedSince(q);
       return paginate(res, data.projects.filter((p) => (id === null || p.ProjectID === id) && changed(p)), q);
@@ -136,12 +143,15 @@ function handleGet(res, path, q) {
       return respond();
     }
     case '/api/v1/Invoices':
+      if (firstPage(q)) requests.invoices += 1;
       return paginate(res, data.invoices, q);
     case '/api/v1/ExpenseClaims': {
+      if (firstPage(q)) requests.expenseClaims += 1;
       const end = day(q.get('EndDate'));
       return paginate(res, data.expenseClaims.filter((c) => !end || day(c.Date) <= end), q);
     }
     case '/api/v1/Forecasts': {
+      if (firstPage(q)) requests.forecasts += 1;
       const moduleID = num(q.get('ModuleID'));
       const start = day(q.get('StartDate'));
       const end = day(q.get('EndDate'));
