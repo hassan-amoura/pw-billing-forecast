@@ -454,83 +454,148 @@ function projectModuleIDs(project) {
 }
 
 /**
- * Make the module set exact for every non-archived project.
+ * Read the modules of each project with one GET /Modules?ProjectID= per
+ * project, `concurrency` at a time.
  *
- * The paged /Modules read is unstable (ties in the API's sort) and comes back
- * ~120 short on SJB, almost all of it on archived projects. Each project
- * record lists its module IDs, so the gap is known exactly: only the
- * non-archived projects with a listed module missing are re-read by ProjectID.
- * A ProjectID read is a single small page, so it is not exposed to the page
- * shifting that loses records in the full read.
+ * The bulk /Modules read is unusable: the API sorts by ModuleName with nothing
+ * to break ties and honours no sort parameter, so offset pages overlap and gap
+ * differently on every request. A project's modules fit on one page (the
+ * largest SJB project has well under 1,000), so a per-project read is not
+ * exposed to that at all.
  *
- * A per-project read that completes is authoritative for that project: a
- * listed ID it does not return was deleted after the project list was read,
- * and is not reported missing. Gaps on archived projects are counted, never
- * fetched.
+ * A project is complete when its read met x-total-count, every row belongs to
+ * the project (an ignored filter cannot pass off another project's modules),
+ * and every ModuleID the project record lists arrived. An incomplete or failed
+ * read is retried up to `attempts` times in total; the transport already
+ * backs off on 429/5xx inside each attempt.
  *
  * @param {object} args
- * @param {object[]} args.projects        project records (with Modules / ModuleIDs)
- * @param {object[]} args.modules         deduplicated modules from the paged read
- * @param {(project) => boolean} args.isArchived
- * @param {(projectID: string) => Promise<{ rows: object[], report: { complete: boolean } }>} args.fetchProjectModules
- * @returns {Promise<{ modules: object[], detectable: boolean, refetchedProjects: number,
- *   recovered: number, missingActive: { projectID: string, moduleIDs: string[], error?: string }[],
- *   missingArchived: number, missingArchivedProjects: number }>}
+ * @param {object[]} args.projects
+ * @param {(projectID: string) => Promise<{ rows: object[], report: { complete: boolean, total: number|null } }>} args.fetchProjectModules
+ * @param {number} [args.concurrency=10]
+ * @param {number} [args.attempts=3]
+ * @param {({ done: number, total: number }) => void} [args.onProgress]
+ * @param {(info: { projectID: string, attempt: number, reason: string }) => void} [args.onRetry]
+ * @returns {Promise<{ modules: object[], results: { projectID: string, modules: number, total: number|null,
+ *   attempts: number, complete: boolean, reason?: string }[],
+ *   failed: { projectID: string, reason: string, partial: object[] }[] }>}
+ *   `modules` holds complete projects only; a failed project's last rows are in
+ *   its `partial`, for the caller to use or replace.
  */
-async function reconcileModules({ projects, modules, isArchived, fetchProjectModules }) {
+async function fetchModulesByProject({ projects, fetchProjectModules, concurrency = 10, attempts = 3, onProgress, onRetry }) {
+  const progress = typeof onProgress === 'function' ? onProgress : () => {};
+  const retried = typeof onRetry === 'function' ? onRetry : () => {};
+  const idOf = (m) => String(firstValue(m, ['ModuleID', 'moduleID']));
+  const queue = projects.map((project) => ({ projectID: String(firstValue(project, ['ProjectID', 'projectID'])), project }));
+  const results = new Array(queue.length);
+  let done = 0;
+  progress({ done, total: queue.length });
+
+  async function readOne({ projectID, project }) {
+    const expected = projectModuleIDs(project);
+    let last = { projectID, modules: 0, total: null, attempts: 0, complete: false, reason: 'not read', rows: [] };
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      let reason = '';
+      let rows = [];
+      let total = null;
+      try {
+        const read = await fetchProjectModules(projectID);
+        total = read.report ? read.report.total : null;
+        rows = (read.rows || []).filter((row) => String(firstValue(row, ['ProjectID', 'projectID'])) === projectID);
+        const foreign = (read.rows || []).length - rows.length;
+        const got = new Set(rows.map(idOf));
+        const unlisted = expected ? expected.filter((id) => !got.has(id)).length : 0;
+        if (foreign) reason = `${foreign} row(s) for another project`;
+        else if (!read.report || !read.report.complete) reason = `fetched ${got.size} of x-total-count ${total}`;
+        else if (unlisted) reason = `${unlisted} listed module(s) missing`;
+      } catch (err) {
+        reason = String((err && err.message) || err);
+      }
+      last = { projectID, modules: rows.length, total, attempts: attempt, complete: !reason, rows, ...(reason ? { reason } : {}) };
+      if (!reason) break;
+      if (attempt < attempts) retried({ projectID, attempt, reason });
+    }
+    return last;
+  }
+
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, queue.length)) }, async () => {
+    while (next < queue.length) {
+      const index = next;
+      next += 1;
+      results[index] = await readOne(queue[index]);
+      done += 1;
+      progress({ done, total: queue.length });
+    }
+  });
+  await Promise.all(workers);
+
+  const modules = [];
+  const failed = [];
+  for (const result of results) {
+    if (result.complete) modules.push(...result.rows);
+    else failed.push({ projectID: result.projectID, reason: result.reason, partial: result.rows });
+    delete result.rows;
+  }
+  return { modules, results, failed };
+}
+
+/**
+ * Incremental refresh: apply the modules changed since the last sync to the
+ * cached set, then decide which projects still need a full per-project read.
+ *
+ * `projects` is the complete, current list of ACTIVE projects (read in full on
+ * every refresh: it is four pages, and each record lists its ModuleIDs, which
+ * is what reveals deleted modules and projects that became active). A changed
+ * module on a project that is not active is ignored. For each active project:
+ *   - a cached module no longer listed is dropped (deleted in Projectworks);
+ *   - a listed module that is not cached, or a project new to the active set
+ *     without a module list, sends the project to `toFetch`.
+ *
+ * @returns {{ modules: object[], toFetch: string[], removed: number, updated: number }}
+ */
+function mergeModuleChanges({ projects, previousProjectIDs, previousModules, changedModules }) {
   const idOf = (m) => String(firstValue(m, ['ModuleID', 'moduleID']));
   const projectOf = (r) => String(firstValue(r, ['ProjectID', 'projectID']));
-  const byID = new Map(modules.map((m) => [idOf(m), m]));
-  const result = {
-    modules,
-    detectable: false,
-    refetchedProjects: 0,
-    recovered: 0,
-    missingActive: [],
-    missingArchived: 0,
-    missingArchivedProjects: 0,
-  };
-
-  const toFetch = [];
-  for (const project of projects) {
-    const expected = projectModuleIDs(project);
-    if (!expected) continue;
-    result.detectable = true;
-    const missing = expected.filter((id) => !byID.has(id));
-    if (!missing.length) continue;
-    if (isArchived(project)) {
-      result.missingArchived += missing.length;
-      result.missingArchivedProjects += 1;
+  const active = new Map(projects.map((p) => [projectOf(p), p]));
+  const byID = new Map();
+  for (const m of previousModules) if (active.has(projectOf(m))) byID.set(idOf(m), m);
+  let updated = 0;
+  for (const m of changedModules) {
+    const id = idOf(m);
+    if (active.has(projectOf(m))) {
+      byID.set(id, m);
+      updated += 1;
     } else {
-      toFetch.push({ projectID: projectOf(project), missing });
+      byID.delete(id); // moved to, or still on, a project that is not active
     }
   }
-  if (!toFetch.length) return result;
 
-  const settled = await Promise.all(toFetch.map(async ({ projectID, missing }) => {
-    try {
-      return { projectID, missing, ...(await fetchProjectModules(projectID)) };
-    } catch (err) {
-      return { projectID, missing, error: String((err && err.message) || err) };
-    }
-  }));
-  result.refetchedProjects = settled.length;
-  for (const { projectID, missing, rows, report, error } of settled) {
-    for (const row of rows || []) {
-      if (projectOf(row) !== projectID) continue; // an ignored filter cannot pass off another project's module
-      const id = idOf(row);
-      if (!byID.has(id)) result.recovered += 1;
-      byID.set(id, row);
-    }
-    const stillMissing = missing.filter((id) => !byID.has(id));
-    if (error || !report || !report.complete) {
-      if (stillMissing.length) {
-        result.missingActive.push({ projectID, moduleIDs: stillMissing, ...(error ? { error } : {}) });
-      }
-    }
+  const byProject = new Map();
+  for (const m of byID.values()) {
+    const key = projectOf(m);
+    if (!byProject.has(key)) byProject.set(key, []);
+    byProject.get(key).push(m);
   }
-  result.modules = [...byID.values()];
-  return result;
+  const known = new Set([...previousProjectIDs].map(String));
+  const modules = [];
+  const toFetch = [];
+  let removed = 0;
+  for (const [projectID, project] of active) {
+    const cached = byProject.get(projectID) || [];
+    const listed = projectModuleIDs(project);
+    if (!listed) {
+      if (!known.has(projectID)) toFetch.push(projectID);
+      else modules.push(...cached);
+      continue;
+    }
+    const listedSet = new Set(listed);
+    const kept = cached.filter((m) => listedSet.has(idOf(m)));
+    removed += cached.length - kept.length;
+    if (kept.length < listedSet.size) toFetch.push(projectID);
+    else modules.push(...kept);
+  }
+  return { modules, toFetch, removed, updated };
 }
 
 module.exports = {
@@ -547,8 +612,9 @@ module.exports = {
   moduleMonthTotals,
   normalizedLabel,
   parseList,
+  fetchModulesByProject,
+  mergeModuleChanges,
   projectModuleIDs,
-  reconcileModules,
   resolveExpenseStatusFilter,
   resolveModuleCustomFields,
 };

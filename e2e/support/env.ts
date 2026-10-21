@@ -46,7 +46,8 @@ export function appEnv(port: number, overrides: Record<string, string> = {}): Re
     MODULE_CUSTOM_FIELD_LABELS: 'Stage No,Risk Status,Des / Del',
     MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID: '',
     ARCHIVED_PROJECT_STATUSES: '',
-    STARTUP_DIAGNOSTICS: 'false',
+    MODULE_FETCH_CONCURRENCY: '10',
+    FULL_SYNC_INTERVAL_HOURS: '',
     ...overrides,
   };
 }

@@ -194,47 +194,71 @@ line IDs are preserved. Unmapped audit properties are stored in `audit_log.extra
   the size it actually served. `pw-client.js` reads the page count from those
   headers (never stopping on a merely short page), fetches six pages at a
   time, de-duplicates by ID and compares the result with `x-total-count`.
-- **Module order is unstable, so stages are reconciled per project.** The API
+- **Modules are read one project at a time, active projects only.** The API
   sorts modules by `ModuleName` with nothing to break ties, and honours no
   sort or keyset parameter (`OrderBy`, `SortBy`, `Sort`, `$orderby`,
-  `AfterModuleID`, … — all tested live, all ignored). Offset pages therefore
-  overlap and gap differently on every read: ~120 of 27,779 come back
-  duplicated and as many never arrive, and re-reading pages only reshuffles
-  them. Each page is read once. Every project record lists its module IDs
-  (`Projects[].Modules`, an exact match for `/Modules`), so the gap is known
-  exactly: only **non-archived** projects with a listed module missing are
-  re-read with `/Modules?ProjectID=` (on SJB typically ~5 projects, ~2 s).
-  Gaps on archived projects are a log line. The red **DATA INCOMPLETE**
-  banner appears only for stages still missing on an active project after
-  that, or for a short invoice / expense / forecast read. The tenant lock and
-  the write guard refuse outright.
-  The old build stopped at 200 × 100 = 20,000 modules with only a log line —
-  that is where the "20000 stages" footer came from.
-- **Archived projects never reach the browser.** `/api/grid` drops projects
-  that are archived (see `ARCHIVED_PROJECT_STATUSES`) before building any row.
-  The **Show archived projects** toggle (off by default) re-queries with
-  `includeArchived=1`. On SJB this takes the grid from ~27,800 stages to ~5,900.
+  `AfterModuleID`, … — all tested live, all ignored), so offset pages of the
+  bulk `/Modules` read overlap and gap differently on every request. The app
+  never reads `/Modules` in bulk. It reads `/Projects` in full, keeps only
+  active projects (`IsActive=true` and a status not in
+  `ARCHIVED_PROJECT_STATUSES`), and reads each one's modules with
+  `/Modules?ProjectID=…&IncludeCustomFields=true`, `MODULE_FETCH_CONCURRENCY`
+  (default 10) at a time. A project's modules fit on one page, so paging order
+  cannot lose any. Each project is complete only when its read meets its own
+  `x-total-count`, every row belongs to it, and every module ID its project
+  record lists (`Projects[].Modules`) arrived; otherwise it is re-read (three
+  attempts). 429, 500, 502, 503, 504 and timeouts are retried with exponential
+  backoff and jitter, honouring `Retry-After`.
+- **Archived projects are excluded altogether.** Their modules are never
+  requested, they are never stored in a snapshot, and there is no toggle to
+  show them. On SJB: 919 active of 3,685 projects, 5,866 stages.
+- **Incremental refresh.** After the first full sync, **Load data** reads
+  only `/Modules?ModifiedSinceDate=<previous sync − 15 min>` (verified live:
+  the filter is honoured to the second) and applies it to the cached stages.
+  `/Projects` is still read in full: each record's module list is what reveals
+  deleted stages and projects that became active or archived; a project whose
+  listed modules no longer match the cache is re-read. A full sync runs again
+  when the last one is `FULL_SYNC_INTERVAL_HOURS` (default 24) old, as a
+  backstop for any edit that does not bump `ModifiedDateUTC`.
+- **Nothing about completeness reaches the UI.** There are no error banners
+  or warning notices: SJB staff see the grid, so everything on screen is
+  customer-facing. Incomplete reads, retries, per-project failures and
+  configuration problems are logged server-side only. A project whose read
+  fails keeps its stages from the previous snapshot; a refresh still
+  incomplete after that is logged and discarded when a snapshot exists, so
+  the last good data stays on screen with only a neutral **Last refreshed
+  hh:mm**. A refresh that fails outright does the same. A failed edit says
+  "Couldn't save this change" (or the app's own 4xx reason, such as "Select a
+  user before editing."), never upstream detail.
 - **Organisation filter.** The Organisation select (All / SJB MEL / SJB SYD)
   is built from `GET /api/v1/Offices` and applied server-side by `OfficeID`.
-- **Snapshots: the grid opens instantly.** The last complete read of every
+- **Snapshots: the grid opens instantly.** The last good read of every
   source is kept per forecast window, in memory and gzipped in Postgres
   (`grid_snapshots`), so it survives restarts and deploys. Opening the page
-  serves it straight away, with **Last refreshed hh:mm** in the status line.
-  **Load data** refreshes in the background (`POST /api/grid/refresh`) with a
-  progress bar; the previous data stays on screen until the new snapshot is
+  serves it straight away, with **Last refreshed hh:mm** in the status line;
+  a window with no snapshot yet starts its first sync on page load. **Load
+  data** refreshes in the background (`POST /api/grid/refresh`, `full=1` to
+  force a full sync) with a progress bar and "Refreshing… 412 of 919
+  projects"; the previous data stays on screen until the new snapshot is
   swapped in. Filters rebuild rows from the snapshot without reading
   Projectworks. A forecast write is patched into every snapshot that shows it
   (and into a refresh in flight); supplier lines are read live from Postgres.
   Offices and custom-field definitions are cached for 10 minutes.
 - **Per-phase timings are logged on every refresh**, e.g. `grid refresh
-  2026-10..2027-09 in 9.8s: projects 4.4s (3,685) · reference 1.3s · modules
-  7.6s (27,655 of 27,779, 124 duplicate(s)) · reconcile 2.1s (5 active
-  project(s) re-read, 7 stage(s) recovered) · invoices …`, and every grid
+  2026-10..2027-09 (full) in 205.3s: projects 14.1s (919 active of 3,685) ·
+  reference 13.5s · modules 205.1s (5,866 stages; 919 project(s) read) ·
+  invoices 4.4s · expenses 4.1s · forecasts 4.6s · build 0.2s`, and every grid
   build logs its row counts and build time.
+- **Measured against SJB production (2026-10-21, read-only).** First full
+  sync 205 s: the API serves about 7–8 requests per second whatever the
+  concurrency (latency rises from ~0.65 s alone to ~1.2 s at 10 in flight), so
+  919 per-project reads cannot go much faster. Incremental refresh 9 s, most of
+  it the four `/Projects` pages. Cached page load: `/api/grid` 120 ms (build
+  ~90 ms, 3.5 MB); grid rendered in the browser ~310 ms after opening the
+  page; after a restart the snapshot is restored from Postgres in 22 ms.
 - **No full read at boot.** Boot reads only `/Projects` (the tenant lock).
   The custom-field and invoice-status diagnostics are logged after the first
-  refresh from its data; `STARTUP_DIAGNOSTICS=true` restores the old full
-  Modules + Invoices read at boot (3.5–4 minutes on Render).
+  refresh from its data.
 - **Supplier-line writes are checked server-side.** A supplier line cannot be
   added to or edited against a services module even if a caller bypasses the UI.
 - **Stale edits fail visibly.** Gross writes compare the grid's prior value
@@ -260,7 +284,9 @@ starts, in order:
    active projects plus projects archived by status and by `IsActive=false`,
    22,000+ modules with and without Stage No, and approved and non-approved
    invoices and expense claims. Pages are capped at 750 so a client that took a
-   short page as the last one would truncate;
+   short page as the last one would truncate. Control endpoints inject
+   per-project failures and short reads, an outage, and edits/deletions with
+   a bumped `ModifiedDateUTC`, and report every ProjectID requested;
 3. the app with the production variable set and `ALLOW_WRITES=true` (port 4311);
 4. the app with `ALLOW_WRITES=false` (port 4312).
 
@@ -271,9 +297,10 @@ chromium` once if Chromium 1179 is not already cached.
 | Spec | Covers |
 |---|---|
 | `auth.spec.ts` | Basic auth gate: 401 without or with wrong credentials, `/healthz` open, app opens with valid credentials |
-| `pagination.spec.ts` | A production-sized persistent page shift, and page order reshuffled on **every** request, both end with every active stage and no banner, each page read once; an active stage no read returns raises DATA INCOMPLETE naming its project; an archived-only gap is not a banner |
+| `active-only.spec.ts` | A full sync requests modules only for active projects (no bulk read, no archived ProjectID) and no archived project is shown or sent; Load data after it reads only `ModifiedSinceDate` changes and applies an edit and a deletion; a short project read is re-read; 429/500 are retried; an unreadable project keeps its last good stages with no error copy; an incomplete first sync still shows the grid with no error copy |
+| `refresh.spec.ts` | A full refresh shows "Refreshing… N of M projects" over the grid already on screen; a failed refresh (Projectworks down) keeps the last good data, with only "Last refreshed hh:mm" and no error copy, also after a reload |
 | `snapshot.spec.ts` | Reopening the page shows the last snapshot without Load data, with "Last refreshed"; Load data shows progress while the old grid stays usable; a restarted server serves the snapshot from Postgres |
-| `filters.spec.ts` | No truncation (footer count = fixture active total); 500-row cap shown as a neutral status-line note; archived hidden by default, toggle shows them; organisation All / SJB MEL / SJB SYD |
+| `filters.spec.ts` | No truncation (footer count = fixture active total) and no error copy; 500-row cap shown as a neutral status-line note; organisation All / SJB MEL / SJB SYD |
 | `stage-no.spec.ts` | Stage No populated from the custom field and blank when unset; headers use the configured labels |
 | `status-filters.spec.ts` | Gross Fees to Date counts only Finance Approved invoices; Consultant Fees to Date only Approved (ID 4) claims |
 | `writes.spec.ts` | `ALLOW_WRITES=true`: cells editable, an edit sends `{ moduleID, date: "YYYY-MM-01", amount, comment }` to `POST /Forecasts/Set`, is audited, and is patched into the served snapshot; consultant modules are refused |

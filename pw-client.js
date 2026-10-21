@@ -20,8 +20,11 @@
  * boundary between two requests, arriving twice while a neighbour never
  * arrives. Re-reading pages reshuffles the ties again and cannot converge, so
  * this client does not try: records are deduplicated by ID and a short set is
- * reported as such (`missing`). Callers that can name the records they expect
- * recover them with targeted, filtered reads (see reconcileModules).
+ * reported as such (`missing`). Modules are therefore never read in bulk: the
+ * server reads them per project (fetchModulesByProject), one page each.
+ *
+ * Transient failures (429, 500, 502, 503, 504, timeouts, network errors) are
+ * retried with exponential backoff and jitter, honouring Retry-After.
  */
 
 class IncompleteCollectionError extends Error {
@@ -69,7 +72,7 @@ function idOf(record, keys) {
   return null;
 }
 
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -81,7 +84,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * @param {number} [options.pageConcurrency=6]   pages of one collection in flight
  * @param {number} [options.maxConcurrent=12]    requests in flight across the app
  * @param {number} [options.maxPages=200]        hard stop: 200,000 records
- * @param {number} [options.retries=2]
+ * @param {number} [options.retries=4]         retries after the first attempt
+ * @param {number} [options.retryDelayMs=400]   first backoff; doubles per retry
+ * @param {Function} [options.onRetry]          ({ pathname, params, attempt, delayMs, error }) — for logging
  * @param {Function} [options.fetchImpl=fetch]
  */
 function createProjectworksClient(options) {
@@ -90,8 +95,10 @@ function createProjectworksClient(options) {
   const pageSize = options.pageSize || 1000;
   const pageConcurrency = options.pageConcurrency || 6;
   const maxPages = options.maxPages || 200;
-  const retries = options.retries ?? 2;
+  const retries = options.retries ?? 4;
   const retryDelayMs = options.retryDelayMs ?? 400;
+  const maxRetryDelayMs = options.maxRetryDelayMs ?? 15000;
+  const onRetry = typeof options.onRetry === 'function' ? options.onRetry : () => {};
   const fetchImpl = options.fetchImpl || fetch;
   const limit = createLimiter(options.maxConcurrent || 12);
 
@@ -129,14 +136,21 @@ function createProjectworksClient(options) {
     };
   }
 
-  /** One GET, through the global limiter, retried on transient failures. */
+  /**
+   * One GET, through the global limiter, retried on transient failures. The
+   * wait happens outside the limiter, so a backing-off request does not hold
+   * a slot other requests could use.
+   */
   async function request(pathname, params = {}) {
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await limit(() => requestOnce(pathname, params));
       } catch (err) {
         if (!err.retryable || attempt >= retries) throw err;
-        await sleep(Math.max(err.retryAfterMs || 0, retryDelayMs * (attempt + 1)));
+        const backoff = Math.min(maxRetryDelayMs, retryDelayMs * 2 ** attempt);
+        const delayMs = Math.max(err.retryAfterMs || 0, Math.round(backoff / 2 + Math.random() * backoff / 2));
+        onRetry({ pathname, params, attempt: attempt + 1, delayMs, error: String(err.message || err) });
+        await sleep(delayMs);
       }
     }
   }

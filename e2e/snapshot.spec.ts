@@ -28,12 +28,12 @@ test.describe('snapshot: instant load and background refresh', () => {
   test('Load data refreshes in the background with visible progress, then swaps in', async ({ page, request }) => {
     const { expected } = await mockState(request);
     await loadGrid(page);
-    await delayModules(request, 400);
+    await delayModules(request, 1500);
 
     await page.getByTestId('load-button').click();
     const progress = page.getByTestId('refresh-progress');
     await expect(progress).toBeVisible();
-    await expect(progress).toContainText('Refreshing from Projectworks');
+    await expect(progress).toContainText('Refreshing…');
     await expect(page.getByTestId('load-button')).toHaveText('Refreshing…');
     // The previous snapshot stays on screen and filterable meanwhile.
     await expect(page.getByTestId('grid')).toBeVisible();
@@ -71,7 +71,8 @@ test.describe('snapshot: instant load and background refresh', () => {
       const body = await res.json();
       expect(body.snapshot).not.toBe(false);
       expect(body.meta.fromSnapshot).toBe(true);
-      expect(body.meta.dataComplete).toBe(true);
+      expect(body.meta.integrityErrors).toBeUndefined();
+      expect(body.meta.warnings).toBeUndefined();
       expect(body.rows.length).toBeGreaterThan(0);
     } finally {
       server.kill('SIGTERM');

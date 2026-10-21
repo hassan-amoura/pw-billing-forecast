@@ -19,7 +19,8 @@ Verified read-only against the SJB tenant on 2026-10-20 (`npm run probe`):
   `StatusCode` text directly.
 - **`MODULE_CUSTOM_FIELD_LABELS=Stage No,Risk Status,Des / Del`**: `Stage No`
   (FieldID 18) and `Des / Del` (FieldID 3) are on every module; `Risk Status`
-  was not on any non-archived module, so that column shows blank with a notice.
+  was not on any non-archived module, so that column shows blank (logged
+  server-side; nothing is shown in the UI).
 - Leave `MODULE_CUSTOM_FIELD_ENTITY_TYPE_ID` empty.
 
 Sections below are the earlier sandbox connection record.

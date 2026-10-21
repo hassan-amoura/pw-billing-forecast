@@ -14,8 +14,7 @@ test.describe('status filters', () => {
   test('Consultant Fees to Date counts only Approved expense claims', async ({ page, request }) => {
     const { named } = await mockState(request);
     await loadGrid(page);
-    // EXPENSE_STATUS_CODES=Approved resolves to status ID 4; no unresolved-status warning.
-    await expect(page.getByTestId('warning-banner')).toBeHidden();
+    // EXPENSE_STATUS_CODES=Approved resolves to status ID 4.
     await page.getByTestId('tab-consultant').click();
     await search(page, 'Alpha Tower');
     // Fixture: 2,500 approved (ID 4) + 9,999 submitted (ID 2).

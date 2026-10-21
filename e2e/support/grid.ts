@@ -1,5 +1,5 @@
 import { expect, type APIRequestContext, type Page } from '@playwright/test';
-import { MOCK_URL } from './env';
+import { APP_WRITES_ON_PORT, GATE, MOCK_URL } from './env';
 
 export interface Counts { stages: number; gross: number }
 export interface MockState {
@@ -9,11 +9,13 @@ export interface MockState {
     archivedProjects: number;
     activeProjects: number;
     active: Counts;
-    withArchived: Counts;
     syd: Counts;
     mel: Counts;
   };
-  named: { alphaA: number; alphaB: number; alphaC: number; bravoA: number; zuluZ: number; forecastMonth: string };
+  named: {
+    alphaA: number; alphaB: number; alphaC: number; bravoA: number; zuluZ: number; forecastMonth: string;
+    archivedProjectIDs: number[];
+  };
 }
 
 /** Expected counts and named module IDs, computed by the mock from the data it serves. */
@@ -21,14 +23,6 @@ export async function mockState(request: APIRequestContext): Promise<MockState> 
   const res = await request.get(`${MOCK_URL}/__mock/health`);
   expect(res.ok()).toBeTruthy();
   return res.json();
-}
-
-/** Make /Modules serve `pages` shifted by `by` records for their next `times` requests. */
-export async function shiftModulePages(
-  request: APIRequestContext, pages: number[], by: number, times: number | 'always',
-): Promise<void> {
-  const res = await request.post(`${MOCK_URL}/__mock/shift?pages=${pages.join(',')}&by=${by}&times=${times}`);
-  expect(res.ok()).toBeTruthy();
 }
 
 /** /Modules sorted by ModuleName with ties reshuffled on every request, like the live API. */
@@ -46,8 +40,71 @@ export async function delayModules(request: APIRequestContext, ms: number): Prom
   expect((await request.post(`${MOCK_URL}/__mock/delay?ms=${ms}`)).ok()).toBeTruthy();
 }
 
-export async function moduleRequests(request: APIRequestContext): Promise<{ modulesPaged: number; modulesByProject: number; modulesByID: number }> {
+export interface ModuleRequests {
+  modulesPaged: number; modulesByProject: number; modulesByID: number; modulesModifiedSince: number; projectIDs: number[];
+}
+export async function moduleRequests(request: APIRequestContext): Promise<ModuleRequests> {
   return (await request.get(`${MOCK_URL}/__mock/requests`)).json();
+}
+
+/** The next `times` module reads of each project answer `status`. */
+export async function failProjects(request: APIRequestContext, projectIDs: number[], status: number, times: number | 'always'): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/fail?projects=${projectIDs.join(',')}&status=${status}&times=${times}`)).ok()).toBeTruthy();
+}
+
+/** The next `times` module reads of each project drop one row while still counting it. */
+export async function shortProjects(request: APIRequestContext, projectIDs: number[], times: number | 'always'): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/short?projects=${projectIDs.join(',')}&times=${times}`)).ok()).toBeTruthy();
+}
+
+/** Every Projectworks GET answers 503 until switched off. */
+export async function setOutage(request: APIRequestContext, on: boolean): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/outage?on=${on ? 1 : 0}`)).ok()).toBeTruthy();
+}
+
+/** Edit a module in "Projectworks": new name, bumped ModifiedDateUTC. */
+export async function renameModule(request: APIRequestContext, moduleID: number, name: string): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/touch?module=${moduleID}&name=${encodeURIComponent(name)}`)).ok()).toBeTruthy();
+}
+
+/** Delete a module in "Projectworks" (and from its project's Modules list). */
+export async function deleteModule(request: APIRequestContext, moduleID: number): Promise<void> {
+  expect((await request.post(`${MOCK_URL}/__mock/delete?module=${moduleID}`)).ok()).toBeTruthy();
+}
+
+/** The default window the UI opens with: this month and the next eleven. */
+export function defaultWindow(): { start: string; end: string } {
+  const now = new Date();
+  const ym = (offset: number) => {
+    const d = new Date(now.getFullYear(), now.getMonth() + offset, 15);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  };
+  return { start: ym(0), end: ym(11) };
+}
+
+const APP_URL = `http://127.0.0.1:${APP_WRITES_ON_PORT}`;
+const AUTH = { Authorization: 'Basic ' + Buffer.from(`${GATE.username}:${GATE.password}`).toString('base64') };
+
+/**
+ * Start a FULL refresh of the default window on the writes-on app (Load data
+ * is incremental once a full sync exists). Returns without waiting unless
+ * `wait` is set.
+ */
+export async function startFullRefresh(request: APIRequestContext, { wait = true } = {}): Promise<void> {
+  const { start, end } = defaultWindow();
+  const res = await request.post(`${APP_URL}/api/grid/refresh?start=${start}&end=${end}&full=1`, { headers: AUTH });
+  expect(res.ok()).toBeTruthy();
+  if (!wait) return;
+  await expect.poll(async () =>
+    (await (await request.get(`${APP_URL}/api/grid/refresh?start=${start}&end=${end}`, { headers: AUTH })).json()).status,
+  { timeout: 60_000 }).toBe('done');
+}
+
+/** Nothing on screen reads as an error: no alert roles and no error vocabulary. */
+export async function expectNoErrorCopy(page: Page): Promise<void> {
+  await expect(page.locator('[role="alert"]')).toHaveCount(0);
+  const text = await page.locator('body').innerText();
+  expect(text).not.toMatch(/incomplete|failed|error|missing|could not|unable|retry|warning|archived/i);
 }
 
 export async function resetMock(request: APIRequestContext): Promise<void> {

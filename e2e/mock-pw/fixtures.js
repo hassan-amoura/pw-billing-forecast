@@ -8,8 +8,9 @@
  * true, a few archived through IsActive=false, each project's Modules a plain
  * array of its ModuleIDs, modules in PascalCase with CustomFields entries
  * carrying Label/FieldID/Value, module names repeated across projects (the
- * live API sorts by ModuleName, so ties are the norm), and invoices/expenses
- * in a mix of statuses. Well over 20,000 modules so any page cap shows up.
+ * live API sorts by ModuleName, so ties are the norm), every record carrying
+ * the same bulk-migration ModifiedDateUTC, and invoices/expenses in a mix of
+ * statuses. Well over 20,000 modules so any page cap shows up.
  *
  * Named records the specs rely on are listed in NAMED; everything else is
  * generated from a seeded PRNG. `expected` is computed from the same data the
@@ -22,6 +23,8 @@ const OFFICES = [
 ];
 const STATUS = { signed: [3, 'Signed'], opportunity: [2, 'Unsigned (opportunity)'], archived: [6, 'Archived'] };
 const FIELD = { desDel: 3, stageNo: 18, risk: 19 };
+// SJB's live records all carry the data migration's timestamp (verified 2026-10-21).
+const MIGRATED_AT = '2026-10-19T03:26:13.1133333';
 const GENERATED_PROJECTS = 1300;
 const MODULES_PER_PROJECT = 17;
 
@@ -69,7 +72,7 @@ function buildFixtures() {
       ProjectTypeID: 1, ProjectTypeName: id % 2 ? 'Architecture' : 'Interiors',
       ProjectStatusID: status[0], ProjectStatusName: status[1], CurrencyID: 5, CurrencyCode: 'AUD',
       ProjectManagerID: 10 + (id % 4), ProjectManagerName: ['Ada Lovelace', 'Grace Hopper', 'Alan Turing', 'Edsger Dijkstra'][id % 4],
-      IsActive: isActive, Modules: [], CustomFields: [],
+      IsActive: isActive, Modules: [], CustomFields: [], ModifiedDateUTC: MIGRATED_AT,
     };
     projects.push(p);
     return p;
@@ -80,7 +83,7 @@ function buildFixtures() {
       Budget: budget, GLCodeID: 1, GLCodeCode: services ? '4000' : '5100', GLCodeName: services ? 'Fees' : 'Subconsultants',
       GLCodeTypeID: services ? 1 : 2, GLCodeTypeName: services ? 'Income' : 'Consultant',
       IsDiscount: false, IsActive: active, IsServices: services, FeeTypeID: 1,
-      Tasks: [{ TaskID: 1, TaskName: 'Task' }], CustomFields: customFields(fields),
+      Tasks: [{ TaskID: 1, TaskName: 'Task' }], CustomFields: customFields(fields), ModifiedDateUTC: MIGRATED_AT,
     };
     modules.push(m);
     p.Modules.push(m.ModuleID);
@@ -156,9 +159,9 @@ function buildFixtures() {
   // ---- expected counts --------------------------------------------------
   const archived = (p) => p.IsActive === false || p.ProjectStatusName === 'Archived';
   const projectByID = new Map(projects.map((p) => [p.ProjectID, p]));
-  const keep = (m, { includeArchived = false, officeID = null } = {}) => {
+  const keep = (m, { officeID = null } = {}) => {
     const p = projectByID.get(m.ProjectID);
-    return (includeArchived || !archived(p)) && (!officeID || p.OfficeID === officeID);
+    return !archived(p) && (!officeID || p.OfficeID === officeID);
   };
   const grossDefault = (m) => m.IsServices && m.IsActive; // Gross tab, "Show inactive stages" off
   const count = (opts) => {
@@ -171,7 +174,6 @@ function buildFixtures() {
     archivedProjects: projects.filter(archived).length,
     activeProjects: projects.filter((p) => !archived(p)).length,
     active: count({}),
-    withArchived: count({ includeArchived: true }),
     syd: count({ officeID: 1 }),
     mel: count({ officeID: 2 }),
   };
@@ -181,6 +183,7 @@ function buildFixtures() {
     named: {
       alphaA: alphaA.ModuleID, alphaB: alphaB.ModuleID, alphaC: alphaC.ModuleID, bravoA: bravoA.ModuleID,
       zuluZ: zuluZ.ModuleID, forecastMonth: month(1),
+      archivedProjectIDs: projects.filter(archived).map((p) => p.ProjectID),
     },
   };
 }

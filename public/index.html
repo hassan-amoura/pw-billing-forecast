@@ -143,10 +143,6 @@
   }
   .notice.plan{background:#F1F5FF;border-bottom-color:#CBD8F5;color:#2B3F6B}
   .notice.error{background:#FBE9E7;border-bottom-color:#F0BDB6;color:#7A221A}
-  .archtag{
-    font:600 9px var(--mono);letter-spacing:.08em;text-transform:uppercase;
-    color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 4px;margin-left:6px;
-  }
   .notice.hidden,.hidden{display:none}
   .toast{
     position:fixed;bottom:18px;right:18px;max-width:420px;z-index:50;
@@ -348,7 +344,6 @@
     <input type="search" id="f-q" data-testid="filter-search" placeholder="Project or stage">
   </div>
   <div class="checks">
-    <label title="Archived projects are excluded on the server unless this is ticked."><input type="checkbox" id="f-archived" data-testid="toggle-archived"> Show archived projects</label>
     <label><input type="checkbox" id="f-inactive" data-testid="toggle-inactive"> Show inactive stages</label>
     <label id="f-hidezero-w"><input type="checkbox" id="f-hidezero"> Hide $0 fee stages</label>
     <label id="f-noforecast-w"><input type="checkbox" id="f-noforecast" title="Stages with fee remaining but no forecast entries in the selected range."> Remaining fees &amp; no forecast</label>
@@ -365,9 +360,6 @@
   <button class="tab" data-tab="audit" data-testid="tab-audit">Audit</button>
 </div>
 
-<div class="notice error hidden" id="notice-load-error" data-testid="load-error" role="alert"></div>
-<div class="notice error hidden" id="notice-integrity" data-testid="integrity-banner" role="alert"></div>
-<div class="notice hidden" id="notice-warnings" data-testid="warning-banner"></div>
 <div class="notice hidden" id="notice-readonly" data-testid="readonly-notice">
   Read-only mode: forecast edits are disabled on this server (ALLOW_WRITES=false).
 </div>
@@ -383,12 +375,6 @@
   services stages) − subconsultant fees (app-side supplier lines across its consultant stages). Expand a project
   to see the two components. Edit either on the Gross fees or Consultant fees tab; the change flows through here.
 </div>
-<div class="notice hidden" id="notice-status">
-  <b>Fees to Date is unfiltered.</b> INVOICE_STATUS_CODES is not set, so every invoice status is counted —
-  including drafts and unapproved invoices. Set it to the approved status code(s) for this tenant before
-  trusting or demoing these revenue figures.
-</div>
-<div class="notice hidden" id="notice-expense"></div>
 
 <div class="gridwrap" id="gridwrap">
   <div class="empty" id="empty">Set a forecast range and press <b>Load data</b> to fetch projects, stages, revenue actuals, expense actuals and forecasts from Projectworks. Once loaded, the latest data opens instantly.</div>
@@ -537,8 +523,8 @@
     } catch (e) {
       state.users = [];
       state.selectedUser = null;
-      select.innerHTML = '<option value="">Unable to load users</option>';
-      toast('User load failed: ' + e.message, true);
+      select.innerHTML = '<option value="">No users available</option>';
+      console.warn('User list could not be loaded:', e);
     } finally {
       select.disabled = false;
     }
@@ -735,8 +721,6 @@
     if (state.writes) $('chip-writes').classList.add('on');
     $('notice-readonly').classList.toggle('hidden', state.writes);
     applyCustomFieldLabels(h.customFieldLabels);
-    // Raise the unfiltered-fees banner immediately, not only after a data load.
-    $('notice-status').classList.toggle('hidden', h.invoiceStatusFiltered !== false);
   }).catch(() => {
     $('chip-tenant').textContent = 'server unreachable';
     $('chip-env').classList.add('bad');
@@ -754,7 +738,7 @@
       if (!r.ok) throw new Error(data.error || r.statusText);
       renderOfficeOptions(data.offices || []);
     } catch (e) {
-      toast('Organisation list failed: ' + e.message, true);
+      console.warn('Organisation list could not be loaded:', e);
     }
   }
 
@@ -817,6 +801,24 @@
     clearTimeout(t._h);
     t._h = setTimeout(() => t.classList.remove('show'), err ? 5000 : 2200);
   }
+  /** An HTTP failure carrying its status, so notSavedText can tell the app's own messages from upstream ones. */
+  function requestError(r, data) {
+    const err = new Error((data && data.error) || r.statusText);
+    err.status = r.status;
+    return err;
+  }
+  /**
+   * What a failed edit says on screen. The app's own 4xx messages ("Select a
+   * user before editing.", "…Reload before editing it again.") are shown;
+   * anything else — network, 5xx, Projectworks detail — is a plain retry
+   * prompt, with the cause in the console and the server log.
+   */
+  function notSavedText(e) {
+    console.warn('Edit not saved:', e);
+    return e && e.status >= 400 && e.status < 500 && e.message
+      ? `Not saved: ${e.message}`
+      : "Couldn't save this change. Please try again.";
+  }
   function chipTick(label) {
     const c = $('chip-sync');
     c.textContent = label + ' ' + new Date().toLocaleTimeString();
@@ -832,7 +834,7 @@
   /**
    * The server keeps the last complete snapshot of every Projectworks source,
    * so the grid is built from it in a moment: on page load, and on any change
-   * of the archived or organisation filter (both applied server-side).
+   * of the organisation filter (applied server-side).
    * "Load data" refreshes the snapshot in the background (refresh()) while the
    * current one stays on screen, then swaps the new one in.
    */
@@ -860,7 +862,6 @@
     setLoadButton();
     $('grid').setAttribute('aria-busy', 'true');
     const params = new URLSearchParams({ start, end, office: $('f-office').value || 'all' });
-    if ($('f-archived').checked) params.set('includeArchived', '1');
     if (opts.ifCached) params.set('ifCached', '1');
     try {
       const r = await fetch(`/api/grid?${params}`);
@@ -868,11 +869,10 @@
       if (seq !== state.loadSeq) return; // a newer request owns the grid
       if (!r.ok) throw new Error(data.error || r.statusText);
       if (data.snapshot === false) {
-        // Nothing stored for this range yet; Load data reads it.
-        if (data.refresh && data.refresh.status === 'running') refresh();
+        // Nothing stored for this range yet: read it now, with progress.
+        refresh();
         return;
       }
-      $('notice-load-error').classList.add('hidden');
       state.rows = data.rows;
       state.netRows = data.netRows || [];
       state.supplierLines = data.supplierLines || [];
@@ -884,50 +884,24 @@
       const count = (n) => Number(n || 0).toLocaleString('en-US');
       $('s-meta').innerHTML =
         `<span data-testid="meta-projects">${count(m.projects)}</span> projects · ` +
-        `<span data-testid="meta-stages">${count(m.modules)}</span> stages` +
-        (m.includeArchived ? '' : ` (${count(m.archivedProjects)} archived projects hidden)`) + ' · ' +
+        `<span data-testid="meta-stages">${count(m.modules)}</span> stages · ` +
         `${count(m.invoices)} invoices · ${count(m.expenseClaims)} expenses · ` +
         `${count(m.forecastEntries)} forecast entries`;
-      $('s-meta').title = `${count(m.modulesTotal)} stages and ${count(m.projectsTotal)} projects in Projectworks, ` +
-        `every page fetched and checked against the API's record counts. ` +
-        `Read from Projectworks in ${(m.fetchMs / 1000).toFixed(1)}s.`;
+      $('s-meta').title = 'Active projects only.';
       $('s-refreshed').textContent = m.fetchedAt ? `Last refreshed ${formatRefreshed(m.fetchedAt)}` : '';
       $('s-refreshed').title = m.fetchedAt ? `Projectworks data as of ${new Date(m.fetchedAt).toLocaleString()}. Load data refreshes it.` : '';
       if (Array.isArray(m.offices)) renderOfficeOptions(m.offices);
       applyCustomFieldLabels(m.customFieldLabels);
-      // Fail loudly: stages missing on active projects, or a collection that
-      // did not match the API's own count.
-      const integrity = m.integrityErrors || [];
-      $('notice-integrity').classList.toggle('hidden', integrity.length === 0);
-      $('notice-integrity').innerHTML = integrity.length
-        ? '<b>Data is incomplete — do not rely on these totals.</b> ' +
-          integrity.map(esc).join(' ') + ' Press Load data to retry.'
-        : '';
-      const warnings = m.warnings || [];
-      $('notice-warnings').classList.toggle('hidden', warnings.length === 0);
-      $('notice-warnings').innerHTML = warnings.map(w => `<div>${esc(w)}</div>`).join('');
-      $('notice-status').classList.toggle('hidden',
-        !(typeof data.meta.invoiceStatusFilter === 'string')); // string = unfiltered warning
       buildPmFilter();
-      const expenseProblems = Number(data.meta.expenseCurrencyIssueCount || 0) +
-        Number(data.meta.expenseMissingModuleCount || 0) + Number(data.meta.expenseMissingAmountCount || 0) +
-        Number(data.meta.expenseMissingDateCount || 0);
-      $('notice-expense').classList.toggle('hidden', expenseProblems === 0);
-      $('notice-expense').innerHTML = expenseProblems
-        ? `<b>${expenseProblems} consultant expense actual${expenseProblems === 1 ? '' : 's'} excluded.</b> ` +
-          'A Projectworks currency, stage link, date, or pre-tax amount was missing or did not match. Review the server diagnostics before relying on Consultant Fees to Date.'
-        : '';
-      // A configured custom field the tenant does not return is a server-log
-      // matter (logged at startup), not a user-facing banner: the column is
-      // simply blank.
+      // Completeness, configuration and fetch problems are server-log matters,
+      // never shown here: a blank column or the previous data is what users see.
       render();
       // Another tab or user may have started a refresh of this range: follow it.
       if (m.refresh && m.refresh.status === 'running' && !state.refreshing) refresh();
     } catch (e) {
+      // Whatever is on screen stays; the server has logged the cause.
       if (seq !== state.loadSeq) return;
-      $('notice-load-error').textContent = 'Load failed: ' + e.message;
-      $('notice-load-error').classList.remove('hidden');
-      toast('Load failed: ' + e.message, true);
+      console.warn('Grid load failed:', e);
     } finally {
       state.loading -= 1;
       if (seq === state.loadSeq) $('grid').removeAttribute('aria-busy');
@@ -935,28 +909,38 @@
     }
   }
 
-  const REFRESH_PHASE_LABELS = {
-    projects: 'projects', reference: 'organisations & fields', modules: 'stages', reconcile: 'checking stages',
-    invoices: 'invoices', expenses: 'expenses', forecasts: 'forecasts',
-  };
-
+  /**
+   * "Refreshing… 412 of 919 projects" while stages are read project by
+   * project; "Refreshing…" otherwise. The bar weights the per-project stage
+   * reads most, since they are most of a full sync.
+   */
   function showRefreshProgress(status) {
     const el = $('s-progress');
     if (!status) { el.classList.add('hidden'); return; }
-    const phases = Object.entries(status.phases || {});
-    // Each phase is one share of the bar; a paged phase fills its share page by page.
-    const share = (p) => p.status === 'done' ? 1 : (p.pages ? (p.pagesDone || 0) / p.pages : 0);
-    const fraction = phases.length ? phases.reduce((sum, [, p]) => sum + share(p), 0) / phases.length : 0;
-    const active = phases.filter(([, p]) => p.status === 'running')
-      .map(([name, p]) => REFRESH_PHASE_LABELS[name] + (p.pages ? ` ${p.pagesDone || 0}/${p.pages}` : ''));
-    $('s-progress-fill').style.width = `${Math.round(Math.min(1, fraction) * 100)}%`;
-    $('s-progress-text').textContent = `Refreshing from Projectworks… ${active.join(' · ') || 'finishing'}`;
+    const phases = status.phases || {};
+    const weight = { modules: 6 };
+    let sum = 0, total = 0;
+    for (const [name, p] of Object.entries(phases)) {
+      const w = weight[name] || 1;
+      const share = p.status === 'done' ? 1
+        : (p.projects ? (p.projectsDone || 0) / p.projects : (p.pages ? (p.pagesDone || 0) / p.pages : 0));
+      sum += w * share;
+      total += w;
+    }
+    const m = phases.modules || {};
+    const n = (v) => Number(v || 0).toLocaleString('en-US');
+    $('s-progress-fill').style.width = `${Math.round(Math.min(1, total ? sum / total : 0) * 100)}%`;
+    $('s-progress-text').textContent = m.projects
+      ? `Refreshing… ${n(m.projectsDone)} of ${n(m.projects)} projects`
+      : 'Refreshing…';
     el.classList.remove('hidden');
   }
 
   /**
    * "Load data": refresh the server's snapshot in the background, show its
-   * progress, then swap the new data in. The grid on screen stays usable.
+   * progress, then swap the new data in. The grid on screen stays usable, and
+   * if the refresh cannot complete the server keeps serving the last good
+   * data: the only visible change is the "Last refreshed" time.
    */
   async function refresh() {
     const start = startPick.value, end = endPick.value;
@@ -969,32 +953,20 @@
     try {
       let r = await fetch(`/api/grid/refresh?${params}`, { method: 'POST' });
       let status = await r.json();
-      if (!r.ok) throw new Error(status.error || r.statusText);
-      while (status.status === 'running') {
+      while (r.ok && status.status === 'running') {
         showRefreshProgress(status);
         await sleep(500);
         r = await fetch(`/api/grid/refresh?${params}`);
         status = await r.json();
-        if (!r.ok) throw new Error(status.error || r.statusText);
-      }
-      if (status.status === 'error') throw new Error(status.error || 'refresh failed');
-      showRefreshProgress(null);
-      await load();
-      if ($('notice-load-error').classList.contains('hidden')) {
-        toast('Refreshed from Projectworks.');
-        tickSync();
       }
     } catch (e) {
-      // The previous snapshot stays on screen.
-      $('notice-load-error').textContent = 'Refresh failed: ' + e.message +
-        (state.loaded ? ' The grid still shows the previous data.' : '');
-      $('notice-load-error').classList.remove('hidden');
-      toast('Refresh failed: ' + e.message, true);
+      console.warn('Refresh status unavailable:', e);
     } finally {
       showRefreshProgress(null);
       state.refreshing = false;
       setLoadButton();
     }
+    await load();
   }
 
   function buildPmFilter() {
@@ -1409,8 +1381,7 @@
     }
     if (col.key === 'parentNumber') return `<td ${cellAttrs(col)}>${esc(r.parentNumber)}</td>`;
     if (col.key === 'projectName') {
-      const tag = r.projectArchived ? '<span class="archtag" data-testid="archived-tag">Archived</span>' : '';
-      return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}${tag}</td>`;
+      return `<td ${cellAttrs(col)}>${pwLink(`/Project/Overview/${r.projectID}`, esc(r.projectName), 'Open project overview in Projectworks')}</td>`;
     }
     if (['projectManagerName', 'currencyCode'].includes(col.key)) return `<td ${cellAttrs(col)}>${esc(r[col.key])}</td>`;
     if (col.key === 'stageNumber') return `<td ${cellAttrs(col)}>${esc(r.stageNumber)}</td>`;
@@ -1619,7 +1590,7 @@
         }),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error || r.statusText);
+      if (!r.ok) throw requestError(r, data);
       row.months[month] = amount;
       td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
       tickSync();
@@ -1627,7 +1598,7 @@
     } catch (e) {
       inp.value = prev;
       td.classList.remove('failed'); void td.offsetWidth; td.classList.add('failed');
-      toast('Sync failed: ' + e.message, true);
+      toast(notSavedText(e), true);
     }
   }
 
@@ -1661,7 +1632,7 @@
         }),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error || r.statusText);
+      if (!r.ok) throw requestError(r, data);
       line.months[month] = amount;
       // The module row is the app-side rollup the server just recomputed.
       row.months[month] = data.moduleTotal;
@@ -1679,7 +1650,7 @@
     } catch (e) {
       inp.value = prev;
       td.classList.remove('failed'); void td.offsetWidth; td.classList.add('failed');
-      toast('Save failed: ' + e.message, true);
+      toast(notSavedText(e), true);
     }
   }
 
@@ -1701,13 +1672,13 @@
         }),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error || r.statusText);
+      if (!r.ok) throw requestError(r, data);
       state.supplierLines.push(data.line);
       render();
       toast(`Supplier "${data.line.supplier}" added.`);
       tickSaved();
     } catch (e) {
-      toast('Add supplier failed: ' + e.message, true);
+      toast(notSavedText(e), true);
     }
   }
 
@@ -1728,7 +1699,7 @@
     }
     return a.synced
       ? '<td class="txt sync-ok" title="Written to Projectworks">Projectworks ✓</td>'
-      : `<td class="txt sync-fail" title="${esc(a.error || 'the Projectworks write failed')}">Projectworks ✗</td>`;
+      : `<td class="txt sync-fail" title="Not written to Projectworks">Projectworks ✗</td>`;
   }
 
   async function loadAudit() {
@@ -1752,7 +1723,7 @@
         '</tr>').join('');
       $('s-rows').textContent = entries.length + ' audit entries';
     } catch (e) {
-      toast('Audit load failed: ' + e.message, true);
+      console.warn('Audit entries could not be loaded:', e);
     }
   }
 
@@ -1815,9 +1786,9 @@
 
   // ---- events --------------------------------------------------------
   $('btn-load').addEventListener('click', () => refresh());
-  ['f-archived', 'f-office'].forEach(id => $(id).addEventListener('change', () => {
+  $('f-office').addEventListener('change', () => {
     if (state.loaded) load();
-  }));
+  });
   $('btn-export').addEventListener('click', exportCsv);
   $('cm-save').addEventListener('click', saveColumnModal);
   $('cm-cancel').addEventListener('click', closeColumnModal);

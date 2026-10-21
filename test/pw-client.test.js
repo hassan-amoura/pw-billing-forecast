@@ -129,3 +129,36 @@ test('page progress is reported as each page arrives', async () => {
   });
   assert.deepEqual(seen, ['1/5', '2/5', '3/5', '4/5', '5/5']);
 });
+
+test('429 and 500 are retried with exponential backoff, honouring Retry-After, and each retry is reported', async () => {
+  const statuses = [429, 500, 200];
+  const retries = [];
+  const fetchImpl = async () => {
+    const status = statuses.shift();
+    return status === 200
+      ? new Response(JSON.stringify([{ ModuleID: 1 }]), { status: 200, headers: { 'x-total-count': '1', 'x-page-count': '1' } })
+      : new Response('busy', { status, headers: status === 429 ? { 'retry-after': '0' } : {} });
+  };
+  const pw = createProjectworksClient({
+    baseUrl: 'http://pw.test', authHeaders: () => ({}), timeoutMs: 1000, fetchImpl, retryDelayMs: 4,
+    onRetry: (r) => retries.push(r),
+  });
+  const rows = await pw.getAll('/api/v1/Modules', { ProjectID: 7 }, { idKeys: ['ModuleID'] });
+  assert.equal(rows.length, 1);
+  assert.deepEqual(retries.map((r) => r.attempt), [1, 2]);
+  assert.match(retries[0].error, /429/);
+  assert.match(retries[1].error, /500/);
+  // Jittered within [base/2, base] of an exponentially growing base: 4ms, then 8ms.
+  assert.ok(retries[0].delayMs >= 2 && retries[0].delayMs <= 4);
+  assert.ok(retries[1].delayMs >= 4 && retries[1].delayMs <= 8);
+});
+
+test('a non-retryable 4xx fails at once', async () => {
+  let calls = 0;
+  const pw = createProjectworksClient({
+    baseUrl: 'http://pw.test', authHeaders: () => ({}), timeoutMs: 1000, retryDelayMs: 1,
+    fetchImpl: async () => { calls += 1; return new Response('nope', { status: 400 }); },
+  });
+  await assert.rejects(pw.get('/api/v1/Modules', {}), /400/);
+  assert.equal(calls, 1);
+});

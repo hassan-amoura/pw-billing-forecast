@@ -12,21 +12,28 @@
  * The cap is 750 here (the live API caps at 1000) so that a client which
  * treated a short page as the last page would truncate at 750 records.
  *
+ *   - ModifiedDateUTC on projects and modules, and ModifiedSinceDate on
+ *     /Projects and /Modules (records modified at or after it), as live
+ *
  * Control endpoints (no auth): GET /__mock/health, GET /__mock/forecast-sets,
  * POST /__mock/reset, and:
- *   POST /__mock/shift?pages=3,7&by=64&times=1 — /Modules serves each listed
- *     page `by` records early for its next `times` requests (times=always:
- *     every request). A shifted page repeats the tail of the page before it
- *     and drops as many records from its own end — the duplicate/missing
- *     pattern an unstable sort produces under concurrent paging.
  *   POST /__mock/unstable?on=1 — /Modules sorts by ModuleName, as the live API
- *     does, and breaks the (many) ties at random on EVERY request, so no two
- *     page reads agree on the order and re-reading pages can never converge.
+ *     does, and breaks the (many) ties at random on EVERY request.
  *   POST /__mock/hide?modules=1,2 — those modules are counted in
  *     x-total-count but never served, by any /Modules query, ProjectID
  *     included: a gap no re-read can fill.
+ *   POST /__mock/short?projects=1&times=1 — the next `times` reads of each
+ *     listed project's modules drop one row while still counting it.
+ *   POST /__mock/fail?projects=1,2&status=500&times=2 — the next `times`
+ *     reads of those projects' modules answer `status` (times=always: every).
+ *   POST /__mock/outage?on=1 — every /api/v1 GET answers 503.
+ *   POST /__mock/touch?module=ID&name=New%20name — rename a module and bump
+ *     its ModifiedDateUTC, as an edit in Projectworks does.
+ *   POST /__mock/delete?module=ID — delete a module (and drop it from its
+ *     project's Modules list, bumping the project's ModifiedDateUTC).
  *   POST /__mock/delay?ms=800 — every /Modules response waits this long.
- *   GET  /__mock/requests — count of /Modules requests by kind since reset.
+ *   GET  /__mock/requests — /Modules requests by kind since reset, with every
+ *     ProjectID requested.
  */
 
 const http = require('http');
@@ -39,20 +46,25 @@ const PAGE_CAP = 750;
 
 let data;
 let forecastSets;
-let shift; // Map page -> remaining shifted responses, plus `by`
 let unstable;
 let hidden; // Set of ModuleIDs counted but never served
 let delayMs;
 let requests;
+let failures; // ProjectID -> { status, times }
+let shortReads; // ProjectID -> remaining short reads
+let outage;
 function reset() {
   data = buildFixtures();
   forecastSets = [];
-  shift = { by: 0, pages: new Map() };
   unstable = false;
   hidden = new Set();
   delayMs = 0;
-  requests = { modulesPaged: 0, modulesByProject: 0, modulesByID: 0 };
+  failures = new Map();
+  shortReads = new Map();
+  outage = false;
+  requests = { modulesPaged: 0, modulesByProject: 0, modulesByID: 0, modulesModifiedSince: 0, projectIDs: [] };
 }
+const nowUTC = () => new Date().toISOString().replace('Z', '');
 reset();
 
 function send(res, status, body, headers = {}) {
@@ -60,16 +72,11 @@ function send(res, status, body, headers = {}) {
   res.end(JSON.stringify(body));
 }
 
-function paginate(res, rows, query, { headers = true, pageSizeParam = true, shifting = false, phantom = 0 } = {}) {
+function paginate(res, rows, query, { headers = true, pageSizeParam = true, phantom = 0 } = {}) {
   const page = Math.max(1, Number(query.get('page')) || 1);
   const requested = pageSizeParam ? Number(query.get('pageSize')) || 100 : 100;
   const size = Math.min(requested, PAGE_CAP);
-  let offset = 0;
-  if (shifting && shift.pages.get(page) > 0) {
-    offset = shift.by;
-    shift.pages.set(page, shift.pages.get(page) - 1);
-  }
-  const body = rows.slice(Math.max(0, (page - 1) * size - offset), page * size - offset);
+  const body = rows.slice((page - 1) * size, page * size);
   // `phantom` records are counted but never served (see /__mock/hide).
   const total = rows.length + phantom;
   const extra = headers
@@ -80,28 +87,51 @@ function paginate(res, rows, query, { headers = true, pageSizeParam = true, shif
 
 const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
 const day = (v) => String(v || '').slice(0, 10);
+// ModifiedDateUTC has no zone suffix on the live API; it is UTC.
+const modifiedSince = (q) => {
+  const raw = q.get('ModifiedSinceDate');
+  if (!raw) return () => true;
+  const since = Date.parse(/[zZ]|[+-]\d\d:\d\d$/.test(raw) ? raw : `${raw}Z`);
+  return (record) => Date.parse(`${record.ModifiedDateUTC}Z`) >= since;
+};
 
 function handleGet(res, path, q) {
   switch (path) {
     case '/api/v1/Projects': {
       const id = num(q.get('ProjectID'));
-      return paginate(res, data.projects.filter((p) => id === null || p.ProjectID === id), q);
+      const changed = modifiedSince(q);
+      return paginate(res, data.projects.filter((p) => (id === null || p.ProjectID === id) && changed(p)), q);
     }
     case '/api/v1/Modules': {
       const projectID = num(q.get('ProjectID'));
       const moduleID = num(q.get('ModuleID'));
+      const changed = modifiedSince(q);
       const withFields = String(q.get('IncludeCustomFields')).toLowerCase() === 'true';
-      requests[moduleID !== null ? 'modulesByID' : (projectID !== null ? 'modulesByProject' : 'modulesPaged')] += 1;
+      const kind = moduleID !== null ? 'modulesByID'
+        : (projectID !== null ? 'modulesByProject' : (q.get('ModifiedSinceDate') ? 'modulesModifiedSince' : 'modulesPaged'));
+      requests[kind] += 1;
+      if (projectID !== null) {
+        requests.projectIDs.push(projectID);
+        const failure = failures.get(projectID);
+        if (failure && failure.times > 0) {
+          failure.times -= 1;
+          return send(res, failure.status, { error: 'mock: injected failure' });
+        }
+      }
       let rows = data.modules
-        .filter((m) => (projectID === null || m.ProjectID === projectID) && (moduleID === null || m.ModuleID === moduleID));
+        .filter((m) => (projectID === null || m.ProjectID === projectID) && (moduleID === null || m.ModuleID === moduleID) && changed(m));
       if (unstable) {
         rows = rows
           .map((m) => ({ m, tie: Math.random() }))
           .sort((a, b) => a.m.ModuleName.localeCompare(b.m.ModuleName) || a.tie - b.tie)
           .map(({ m }) => m);
       }
-      const served = rows.filter((m) => !hidden.has(m.ModuleID)).map((m) => (withFields ? m : { ...m, CustomFields: [] }));
-      const respond = () => paginate(res, served, q, { shifting: true, phantom: rows.length - served.length });
+      let served = rows.filter((m) => !hidden.has(m.ModuleID)).map((m) => (withFields ? m : { ...m, CustomFields: [] }));
+      if (projectID !== null && (shortReads.get(projectID) || 0) > 0) {
+        shortReads.set(projectID, shortReads.get(projectID) - 1);
+        served = served.slice(1);
+      }
+      const respond = () => paginate(res, served, q, { phantom: rows.length - served.length });
       if (delayMs) return void setTimeout(respond, delayMs);
       return respond();
     }
@@ -169,17 +199,46 @@ const server = http.createServer((req, res) => {
     delayMs = Number(url.searchParams.get('ms')) || 0;
     return send(res, 200, { ok: true });
   }
-  if (url.pathname === '/__mock/shift' && req.method === 'POST') {
-    const q = url.searchParams;
-    const times = q.get('times') === 'always' ? Infinity : Number(q.get('times')) || 1;
-    shift = { by: Number(q.get('by')) || 64, pages: new Map(String(q.get('pages') || '').split(',').filter(Boolean).map((p) => [Number(p), times])) };
+  const ids = (name) => String(url.searchParams.get(name) || '').split(',').filter(Boolean).map(Number);
+  const times = () => (url.searchParams.get('times') === 'always' ? Infinity : Number(url.searchParams.get('times')) || 1);
+  if (url.pathname === '/__mock/short' && req.method === 'POST') {
+    for (const id of ids('projects')) shortReads.set(id, times());
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/fail' && req.method === 'POST') {
+    const status = Number(url.searchParams.get('status')) || 500;
+    for (const id of ids('projects')) failures.set(id, { status, times: times() });
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/outage' && req.method === 'POST') {
+    outage = url.searchParams.get('on') !== '0';
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/touch' && req.method === 'POST') {
+    const module = data.modules.find((m) => m.ModuleID === Number(url.searchParams.get('module')));
+    if (!module) return send(res, 404, { error: 'mock: no such module' });
+    if (url.searchParams.get('name')) module.ModuleName = url.searchParams.get('name');
+    module.ModifiedDateUTC = nowUTC();
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/__mock/delete' && req.method === 'POST') {
+    const id = Number(url.searchParams.get('module'));
+    const module = data.modules.find((m) => m.ModuleID === id);
+    if (!module) return send(res, 404, { error: 'mock: no such module' });
+    data.modules = data.modules.filter((m) => m !== module);
+    const project = data.projects.find((p) => p.ProjectID === module.ProjectID);
+    project.Modules = project.Modules.filter((m) => m !== id);
+    project.ModifiedDateUTC = nowUTC();
     return send(res, 200, { ok: true });
   }
 
   const expected = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
   if (req.headers.authorization !== expected) return send(res, 401, { error: 'mock: bad credentials' });
 
-  if (req.method === 'GET') return handleGet(res, url.pathname, url.searchParams);
+  if (req.method === 'GET') {
+    if (outage) return send(res, 503, { error: 'mock: outage' });
+    return handleGet(res, url.pathname, url.searchParams);
+  }
   if (req.method === 'POST' && url.pathname === '/api/v1/Forecasts/Set') {
     let raw = '';
     req.on('data', (chunk) => { raw += chunk; });
